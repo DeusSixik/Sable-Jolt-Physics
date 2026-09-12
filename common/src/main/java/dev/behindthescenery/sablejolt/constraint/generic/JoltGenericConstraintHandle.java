@@ -1,7 +1,6 @@
 package dev.behindthescenery.sablejolt.constraint.generic;
 
 import com.github.stephengold.joltjni.MotorSettings;
-import com.github.stephengold.joltjni.Quat;
 import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.SixDofConstraint;
 import com.github.stephengold.joltjni.SixDofConstraintSettings;
@@ -62,12 +61,10 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
 
         final Quaterniondc rotA = config.orientation1();
         final Quaterniondc rotB = config.orientation2();
-        final Quat quatA = new Quat((float) rotA.x(), (float) rotA.y(), (float) rotA.z(), (float) rotA.w());
-        final Quat quatB = new Quat((float) rotB.x(), (float) rotB.y(), (float) rotB.z(), (float) rotB.w());
-        settings.setAxisX1(JoltFixedConstraintHandle.rotate(quatA, Vec3.sAxisX()));
-        settings.setAxisY1(JoltFixedConstraintHandle.rotate(quatA, Vec3.sAxisY()));
-        settings.setAxisX2(JoltFixedConstraintHandle.rotate(quatB, Vec3.sAxisX()));
-        settings.setAxisY2(JoltFixedConstraintHandle.rotate(quatB, Vec3.sAxisY()));
+        settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) rotA.x(), (float) rotA.y(), (float) rotA.z(), (float) rotA.w(), Vec3.sAxisX()));
+        settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) rotA.x(), (float) rotA.y(), (float) rotA.z(), (float) rotA.w(), Vec3.sAxisY()));
+        settings.setAxisX2(JoltFixedConstraintHandle.rotate((float) rotB.x(), (float) rotB.y(), (float) rotB.z(), (float) rotB.w(), Vec3.sAxisX()));
+        settings.setAxisY2(JoltFixedConstraintHandle.rotate((float) rotB.x(), (float) rotB.y(), (float) rotB.z(), (float) rotB.w(), Vec3.sAxisY()));
 
         for (final EAxis axis : EAxis.values()) {
             if (axis == EAxis.Num) {
@@ -208,12 +205,10 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
         settings.setPosition1(this.scene.toLocalAnchor(this.sbA, this.frameA.x(), this.frameA.y(), this.frameA.z()));
         settings.setPosition2(this.scene.toLocalAnchor(this.sbB, this.frameB.x(), this.frameB.y(), this.frameB.z()));
 
-        final Quat quatA = new Quat((float) this.rotA.x, (float) this.rotA.y, (float) this.rotA.z, (float) this.rotA.w);
-        final Quat quatB = new Quat((float) this.rotB.x, (float) this.rotB.y, (float) this.rotB.z, (float) this.rotB.w);
-        settings.setAxisX1(JoltFixedConstraintHandle.rotate(quatA, Vec3.sAxisX()));
-        settings.setAxisY1(JoltFixedConstraintHandle.rotate(quatA, Vec3.sAxisY()));
-        settings.setAxisX2(JoltFixedConstraintHandle.rotate(quatB, Vec3.sAxisX()));
-        settings.setAxisY2(JoltFixedConstraintHandle.rotate(quatB, Vec3.sAxisY()));
+        settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) this.rotA.x, (float) this.rotA.y, (float) this.rotA.z, (float) this.rotA.w, Vec3.sAxisX()));
+        settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) this.rotA.x, (float) this.rotA.y, (float) this.rotA.z, (float) this.rotA.w, Vec3.sAxisY()));
+        settings.setAxisX2(JoltFixedConstraintHandle.rotate((float) this.rotB.x, (float) this.rotB.y, (float) this.rotB.z, (float) this.rotB.w, Vec3.sAxisX()));
+        settings.setAxisY2(JoltFixedConstraintHandle.rotate((float) this.rotB.x, (float) this.rotB.y, (float) this.rotB.z, (float) this.rotB.w, Vec3.sAxisY()));
 
         for (int i = 0; i < 6; i++) {
             if (record.locked[i] || (record.limits[i][0] == 0.0 && record.limits[i][1] == 0.0 && isLockedDefault(i))) {

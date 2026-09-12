@@ -1,7 +1,6 @@
 package dev.behindthescenery.sablejolt.constraint.fixed;
 
 import com.github.stephengold.joltjni.FixedConstraintSettings;
-import com.github.stephengold.joltjni.Quat;
 import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.Vec3;
 import com.github.stephengold.joltjni.enumerate.EConstraintSpace;
@@ -40,9 +39,8 @@ public class JoltFixedConstraintHandle extends JoltConstraintHandle implements F
 
         // frame 1 is rotated by the configured orientation, frame 2 stays identity (mirrors the rapier joint)
         final var q = config.orientation();
-        final Quat quat = new Quat((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w());
-        settings.setAxisX1(rotate(quat, Vec3.sAxisX()));
-        settings.setAxisY1(rotate(quat, Vec3.sAxisY()));
+        settings.setAxisX1(rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisX()));
+        settings.setAxisY1(rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisY()));
 
         final var constraint = scene.createConstraint(settings, joltA, joltB);
 
@@ -62,9 +60,8 @@ public class JoltFixedConstraintHandle extends JoltConstraintHandle implements F
         this.attach(handle);
     }
 
-    public static Vec3 rotate(final Quat q, final Vec3 v) {
-        final float qx = q.getX(), qy = q.getY(), qz = q.getZ(), qw = q.getW();
-        final float vx = v.getX(), vy = v.getY(), vz = v.getZ();
+    public static Vec3 rotate(final float qx, final float qy, final float qz, final float qw,
+                              final float vx, final float vy, final float vz) {
         final float tx = 2.0f * (qy * vz - qz * vy);
         final float ty = 2.0f * (qz * vx - qx * vz);
         final float tz = 2.0f * (qx * vy - qy * vx);
@@ -72,6 +69,12 @@ public class JoltFixedConstraintHandle extends JoltConstraintHandle implements F
                 vx + qw * tx + (qy * tz - qz * ty),
                 vy + qw * ty + (qz * tx - qx * tz),
                 vz + qw * tz + (qx * ty - qy * tx));
+    }
+
+    public static Vec3 rotate(final float qx, final float qy, final float qz, final float qw,
+                              final Vec3 v) {
+        // NOTE: parameter order is (quaternion, vector) here; keep the mapping aligned
+        return rotate(qx, qy, qz, qw, v.getX(), v.getY(), v.getZ());
     }
 
     @Override

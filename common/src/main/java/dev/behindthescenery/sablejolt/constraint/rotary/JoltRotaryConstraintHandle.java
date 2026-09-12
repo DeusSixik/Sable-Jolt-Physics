@@ -43,8 +43,12 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
 
         final double nx1 = config.normal1().x(), ny1 = config.normal1().y(), nz1 = config.normal1().z();
         final double nx2 = config.normal2().x(), ny2 = config.normal2().y(), nz2 = config.normal2().z();
-        settings.setHingeAxis1(normalize(new Vec3((float) nx1, (float) ny1, (float) nz1)));
-        settings.setHingeAxis2(normalize(new Vec3((float) nx2, (float) ny2, (float) nz2)));
+
+        final float nl1 = (float) Math.sqrt(nx1 * nx1 + ny1 * ny1 + nz1 * nz1);
+        final float nl2 = (float) Math.sqrt(nx2 * nx2 + ny2 * ny2 + nz2 * nz2);
+
+        settings.setHingeAxis1(normalize((float) nx1, (float) ny1, (float) nz1, nl1));
+        settings.setHingeAxis2(normalize((float) nx2, (float) ny2, (float) nz2, nl2));
         settings.setNormalAxis1(perpendicular(settings.getHingeAxis1()));
         settings.setNormalAxis2(perpendicular(settings.getHingeAxis2()));
 
@@ -67,21 +71,21 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
         this.attach(handle);
     }
 
-    private static Vec3 normalize(final Vec3 v) {
-        final float length = v.length();
+    private static Vec3 normalize(final float vx, final float vy, final float vz, final float length) {
         if (length < 1.0e-6f) {
             return new Vec3(0.0f, 1.0f, 0.0f);
         }
-        return new Vec3(v.getX() / length, v.getY() / length, v.getZ() / length);
+        return new Vec3(vx / length, vy / length, vz / length);
     }
 
     private static Vec3 perpendicular(final Vec3 axis) {
         final float ax = Math.abs(axis.getX()), ay = Math.abs(axis.getY()), az = Math.abs(axis.getZ());
         final Vec3 other = ax < 0.9f ? new Vec3(1.0f, 0.0f, 0.0f) : new Vec3(0.0f, 0.0f, 1.0f);
-        return normalize(new Vec3(
-                axis.getY() * other.getZ() - axis.getZ() * other.getY(),
-                axis.getZ() * other.getX() - axis.getX() * other.getZ(),
-                axis.getX() * other.getY() - axis.getY() * other.getX()));
+        final float x = axis.getY() * other.getZ() - axis.getZ() * other.getY();
+        final float y = axis.getZ() * other.getX() - axis.getX() * other.getZ();
+        final float z = axis.getX() * other.getY() - axis.getY() * other.getX();
+
+        return normalize(x, y, z, (float) Math.sqrt(x * x + y * y + z * z));
     }
 
     @Override

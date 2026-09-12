@@ -1,6 +1,5 @@
 package dev.behindthescenery.sablejolt.constraint.free;
 
-import com.github.stephengold.joltjni.Quat;
 import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.SixDofConstraint;
 import com.github.stephengold.joltjni.SixDofConstraintSettings;
@@ -52,9 +51,8 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         settings.setPosition2(RVec3.sZero());
 
         final var q = config.orientation();
-        final Quat quat = new Quat((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w());
-        settings.setAxisX1(JoltFixedConstraintHandle.rotate(quat, Vec3.sAxisX()));
-        settings.setAxisY1(JoltFixedConstraintHandle.rotate(quat, Vec3.sAxisY()));
+        settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisX()));
+        settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisY()));
 
         for (final EAxis axis : EAxis.values()) {
             if (axis == EAxis.Num) {

@@ -604,8 +604,13 @@ public final class JoltPhysicsScene {
         }
 
         final Quat rot = body.getRotation();
-        final Vec3 impulse = rotate(new Vec3((float) fx, (float) fy, (float) fz), rot);
-        final Vec3 offset = rotate(new Vec3((float) x, (float) y, (float) z), rot);
+        final float qx = rot.getX();
+        final float qy = rot.getY();
+        final float qz = rot.getZ();
+        final float qw = rot.getW();
+
+        final Vec3 impulse = rotate((float) fx, (float) fy, (float) fz, qx, qy, qz, qw);
+        final Vec3 offset = rotate((float) x, (float) y, (float) z, qx, qy, qz, qw);
         final RVec3 com = body.getCenterOfMassPosition();
 
         // Jolt does not wake bodies on AddImpulse; activation is required separately
@@ -627,16 +632,26 @@ public final class JoltPhysicsScene {
         }
 
         final Quat rot = body.getRotation();
-        body.addImpulse(rotate(new Vec3((float) fx, (float) fy, (float) fz), rot));
-        body.addAngularImpulse(rotate(new Vec3((float) tx, (float) ty, (float) tz), rot));
+        final float rotX = rot.getX();
+        final float rotY = rot.getY();
+        final float rotZ = rot.getZ();
+        final float rotW = rot.getW();
+
+        final Vec3 impulse = rotate((float) fx, (float) fy, (float) fz, rotX, rotY, rotZ, rotW);
+        body.addImpulse(impulse.getX(), impulse.getY(), impulse.getZ());
+        body.addAngularImpulse(rotate((float) tx, (float) ty, (float) tz, rotX, rotY, rotZ, rotW));
         if (wakeUp) {
             this.bi.activateBody(sb.joltId);
         }
     }
 
-    private static Vec3 rotate(final Vec3 v, final Quat q) {
-        final float qx = q.getX(), qy = q.getY(), qz = q.getZ(), qw = q.getW();
-        final float vx = v.getX(), vy = v.getY(), vz = v.getZ();
+    private static Vec3 rotate(final float vx, final float vy, final float vz,
+                               final Quat q) {
+        return rotate(vx, vy, vz, q.getX(), q.getY(), q.getZ(), q.getW());
+    }
+
+    private static Vec3 rotate(final float vx, final float vy, final float vz,
+                               final float qx, final float qy, final float qz, final float qw) {
         // t = 2 * cross(q.xyz, v)
         final float tx = 2.0f * (qy * vz - qz * vy);
         final float ty = 2.0f * (qz * vx - qx * vz);
@@ -658,7 +673,7 @@ public final class JoltPhysicsScene {
         if (sb == null) {
             return new RVec3(x, y, z);
         }
-        final Vec3 offset = rotate(new Vec3((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z)),
+        final Vec3 offset = rotate((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z),
                 sb.body.getRotation().conjugated());
         return new RVec3(offset.getX(), offset.getY(), offset.getZ());
     }
@@ -1355,8 +1370,7 @@ public final class JoltPhysicsScene {
             final double lpy = c.by + 0.5 - sb.centerOfMass.y;
             final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
 
-            final Vec3 local = new Vec3((float) lpx, (float) lpy, (float) lpz);
-            final Vec3 worldOffset = rotate(local, rot);
+            final Vec3 worldOffset = rotate((float) lpx, (float) lpy, (float) lpz, rot);
             final double wx = comX + worldOffset.getX();
             final double wy = comY + worldOffset.getY();
             final double wz = comZ + worldOffset.getZ();
@@ -1925,9 +1939,8 @@ public final class JoltPhysicsScene {
                 if (result == null || result.length < 4) {
                     return;
                 }
-                final Vec3 localTangent = new Vec3((float) result[0], (float) result[1], (float) result[2]);
                 final Quat rot = body.getRotation();
-                tangent = rotate(localTangent, rot);
+                tangent = rotate((float) result[0], (float) result[1], (float) result[2], rot);
                 final boolean remove = result[3] > 0.0;
                 if (remove) {
                     settings.setIsSensor(true);
@@ -1951,8 +1964,8 @@ public final class JoltPhysicsScene {
                 return;
             }
             final Quat rot = body.getRotation();
-            final Vec3 lin = rotate(new Vec3((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z), rot);
-            final Vec3 ang = rotate(new Vec3((float) sb.angVel.x, (float) sb.angVel.y, (float) sb.angVel.z), rot);
+            final Vec3 lin = rotate((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z, rot);
+            final Vec3 ang = rotate((float) sb.angVel.x, (float) sb.angVel.y, (float) sb.angVel.z, rot);
 
             // approximate surface velocity at the body center; direction relative to body 1 / 2
             final float sign = isFirst ? -1.0f : 1.0f;
@@ -2008,8 +2021,8 @@ public final class JoltPhysicsScene {
 
             final Quat r1 = body1.getRotation();
             final Quat r2 = body2.getRotation();
-            final Vec3 worldP1 = rotate(new Vec3((float) px1, (float) py1, (float) pz1), r1);
-            final Vec3 worldP2 = rotate(new Vec3((float) px2, (float) py2, (float) pz2), r2);
+            final Vec3 worldP1 = rotate((float) px1, (float) py1, (float) pz1, r1);
+            final Vec3 worldP2 = rotate((float) px2, (float) py2, (float) pz2, r2);
 
             final double p1x = com1x + worldP1.getX(), p1y = com1y + worldP1.getY(), p1z = com1z + worldP1.getZ();
             final double p2x = com2x + worldP2.getX(), p2y = com2y + worldP2.getY(), p2z = com2z + worldP2.getZ();
