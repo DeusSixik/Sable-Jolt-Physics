@@ -12,4 +12,6 @@ dependencies {
     compileOnly "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version"
 
     modCompileOnly files(rootProject.file("libs/dev.ryanhcode.sable.sable-sable_rapier-1.21.1-2.0.5.jar"))
+    modCompileOnly files(rootProject.file("libs/sable-fabric-1.21.1-2.0.5.jar"))
+    modCompileOnly files(rootProject.file("libs/sable-companion-fabric-1.21.1-1.6.0.jar"))
 }
