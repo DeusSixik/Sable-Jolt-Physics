@@ -1,0 +1,32 @@
+modLoader = "javafml"
+loaderVersion = "[2,)"
+#issueTrackerURL = ""
+license = "GNU LGPL 3.0"
+
+[[mods]]
+modId = "sable-jolt-physics"
+version = "${version}"
+displayName = "Sable-Jolt-Physics"
+authors = ""
+description = '''
+
+'''
+#logoFile = ""
+
+[[dependencies.sable-jolt-physics]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.sable-jolt-physics]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+
+[[mixins]]
+config = "sable-jolt-physics.mixins.json"

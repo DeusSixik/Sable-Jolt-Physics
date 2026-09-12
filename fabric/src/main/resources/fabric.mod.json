@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "sable-jolt-physics",
+  "version": "${version}",
+  "name": "Sable-Jolt-Physics",
+  "description": "",
+  "authors": [
+    ""
+  ],
+  "contact": {
+    "homepage": ""
+  },
+  "license": "LGPL-3.0",
+  "icon": "assets/sable-jolt-physics/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.behindthescenery.sableJoltPhysics.fabric.SableJoltPhysicsFabric"
+    ],
+    "client": [
+      "dev.behindthescenery.sableJoltPhysics.fabric.client.SableJoltPhysicsFabricClient"
+    ]
+  },
+  "mixins": [
+    "sable-jolt-physics.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "another-mod": "*"
+  }
+}
