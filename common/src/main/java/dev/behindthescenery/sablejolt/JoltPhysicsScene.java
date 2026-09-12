@@ -268,12 +268,27 @@ public final class JoltPhysicsScene {
 
         public final Vector3d centerOfMass = new Vector3d();
 
-        public int mountId = -1;
+        public         int mountId = -1;
         public final Vector3d relPos = new Vector3d();
         public final Quaterniond relRot = new Quaterniond(1.0, 0.0, 0.0, 0.0);
         public final Vector3d linVel = new Vector3d();
         public final Vector3d angVel = new Vector3d();
         public int groupSubId = -1;
+
+        // Dedup state of the last shape rebuild: if none of these inputs changed,
+        // the rebuild is skipped (mass-stat updates arrive every tick).
+        long rebuiltDataVersion = -1;
+        boolean rebuiltHasBounds;
+        int rebuiltMinX;
+        int rebuiltMinY;
+        int rebuiltMinZ;
+        int rebuiltMaxX;
+        int rebuiltMaxY;
+        int rebuiltMaxZ;
+        double rebuiltComX = Double.NaN;
+        double rebuiltComY;
+        double rebuiltComZ;
+        int rebuiltOwnChunks = -1;
 
         public SableBody(final Kind kind, final int runtimeId) {
             this.kind = kind;
@@ -687,6 +702,17 @@ public final class JoltPhysicsScene {
     }
 
     private void rebuildShape(final SableBody sb) {
+        // Dedup: mass-stat updates arrive every tick with the same inputs; a rebuild
+        // is only needed when the com, bounds, chunk set or chunk data changed.
+        if (sb.rebuiltDataVersion == this.chunkDataVersion
+                && sb.rebuiltHasBounds == sb.hasBounds
+                && sb.rebuiltMinX == sb.minX && sb.rebuiltMinY == sb.minY && sb.rebuiltMinZ == sb.minZ
+                && sb.rebuiltMaxX == sb.maxX && sb.rebuiltMaxY == sb.maxY && sb.rebuiltMaxZ == sb.maxZ
+                && sb.rebuiltComX == sb.centerOfMass.x && sb.rebuiltComY == sb.centerOfMass.y && sb.rebuiltComZ == sb.centerOfMass.z
+                && sb.rebuiltOwnChunks == sb.chunks.size()) {
+            return;
+        }
+
         final MutableCompoundShape shape = new MutableCompoundShape();
         sb.children.clear();
 
@@ -721,6 +747,19 @@ public final class JoltPhysicsScene {
 
         sb.shape = shape;
         this.bi.setShape(sb.joltId, shape, false, EActivation.DontActivate);
+
+        sb.rebuiltDataVersion = this.chunkDataVersion;
+        sb.rebuiltHasBounds = sb.hasBounds;
+        sb.rebuiltMinX = sb.minX;
+        sb.rebuiltMinY = sb.minY;
+        sb.rebuiltMinZ = sb.minZ;
+        sb.rebuiltMaxX = sb.maxX;
+        sb.rebuiltMaxY = sb.maxY;
+        sb.rebuiltMaxZ = sb.maxZ;
+        sb.rebuiltComX = sb.centerOfMass.x;
+        sb.rebuiltComY = sb.centerOfMass.y;
+        sb.rebuiltComZ = sb.centerOfMass.z;
+        sb.rebuiltOwnChunks = sb.chunks.size();
 
         if (JoltDebugLogging.STAFF) {
             int sectionsInWindow = 0;
@@ -816,6 +855,7 @@ public final class JoltPhysicsScene {
 
         final long key = ChunkSectionData.packSectionPos(x, y, z);
         this.allChunks.put(key, section);
+        this.chunkDataVersion++;
 
         if (global) {
             final GlobalChunk chunk = new GlobalChunk(x, y, z, section);
@@ -911,6 +951,7 @@ public final class JoltPhysicsScene {
     public void removeChunk(final int x, final int y, final int z, final boolean global) {
         final long key = ChunkSectionData.packSectionPos(x, y, z);
         this.allChunks.remove(key);
+        this.chunkDataVersion++;
 
         if (global) {
             final GlobalChunk chunk = this.globalChunks.remove(key);
@@ -929,6 +970,7 @@ public final class JoltPhysicsScene {
             return;
         }
         data.set(x & 15, y & 15, z & 15, newState);
+        this.chunkDataVersion++;
 
         boolean any = false;
         for (final SableBody sb : this.bodies.values()) {
@@ -1092,6 +1134,12 @@ public final class JoltPhysicsScene {
 
     private final it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap mountGroupIds = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
 
+    /**
+     * Bumped whenever any chunk section data changes; used to invalidate the
+     * per-body shape rebuild dedup.
+     */
+    private long chunkDataVersion;
+
     public void removeKinematicContraption(final int id) {
         final SableBody sb = this.bodies.get(id);
         if (sb != null) {
@@ -1195,7 +1243,7 @@ public final class JoltPhysicsScene {
         }
 
         for (final SableBody sb : this.bodies.values()) {
-            if (sb.kind != SableBody.Kind.SUB_LEVEL || !sb.hasBounds) {
+            if (sb.kind != SableBody.Kind.SUB_LEVEL || !sb.hasBounds || sb.children.isEmpty()) {
                 continue;
             }
 
@@ -1215,72 +1263,43 @@ public final class JoltPhysicsScene {
             final int sizeSum = (sb.maxX - sb.minX) + (sb.maxY - sb.minY) + (sb.maxZ - sb.minZ);
             final boolean complex = sizeSum < 10;
 
-            final int chunkMinX = (sb.minX >> 4) - 1;
-            final int chunkMinY = (sb.minY >> 4) - 1;
-            final int chunkMinZ = (sb.minZ >> 4) - 1;
-            final int chunkMaxX = (sb.maxX >> 4) + 1;
-            final int chunkMaxY = (sb.maxY >> 4) + 1;
-            final int chunkMaxZ = (sb.maxZ >> 4) + 1;
+            // Iterate the body's own collider blocks (already rebuilt and bounds-filtered
+            // in sb.children) instead of rescanning chunk section data.
+            for (final Child c : sb.children) {
+                final double lpx = c.bx + 0.5 - sb.centerOfMass.x;
+                final double lpy = c.by + 0.5 - sb.centerOfMass.y;
+                final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
 
-            for (final var chunkEntry : this.allChunks.long2ObjectEntrySet()) {
-                final long key = chunkEntry.getLongKey();
-                final int cx = unpackChunkX(key);
-                final int cy = unpackChunkY(key);
-                final int cz = unpackChunkZ(key);
-                if (cx < chunkMinX || cx > chunkMaxX || cy < chunkMinY || cy > chunkMaxY || cz < chunkMinZ || cz > chunkMaxZ) {
+                final Vec3 local = new Vec3((float) lpx, (float) lpy, (float) lpz);
+                final Vec3 worldOffset = rotate(local, rot);
+                final double wx = comX + worldOffset.getX();
+                final double wy = comY + worldOffset.getY();
+                final double wz = comZ + worldOffset.getZ();
+
+                final int wbx = floor(wx);
+                final int wby = floor(wy);
+                final int wbz = floor(wz);
+                if (!this.isGlobalFluid(wbx, wby, wbz)) {
                     continue;
                 }
-                final ChunkSectionData data = chunkEntry.getValue();
 
-                for (int bx = 0; bx < 16; bx++) {
-                    for (int by = 0; by < 16; by++) {
-                        for (int bz = 0; bz < 16; bz++) {
-                            final int packed = data.get(bx, by, bz);
-                            if (!isSolidBlock(packed, this.colliderRegistry.get(ChunkSectionData.colliderIdOf(packed) - 1))) {
-                                continue;
-                            }
-                            if (!sb.contains((cx << 4) + bx, (cy << 4) + by, (cz << 4) + bz)) {
-                                continue;
-                            }
+                final JoltVoxelColliderData entry = this.colliderRegistry.get(c.colliderId - 1);
 
-                            final double lpx = (cx << 4) + bx + 0.5 - sb.centerOfMass.x;
-                            final double lpy = (cy << 4) + by + 0.5 - sb.centerOfMass.y;
-                            final double lpz = (cz << 4) + bz + 0.5 - sb.centerOfMass.z;
-
-                            final Vec3 local = new Vec3((float) lpx, (float) lpy, (float) lpz);
-                            final Vec3 worldOffset = rotate(local, rot);
-                            final double wx = comX + worldOffset.getX();
-                            final double wy = comY + worldOffset.getY();
-                            final double wz = comZ + worldOffset.getZ();
-
-                            final int wbx = floor(wx);
-                            final int wby = floor(wy);
-                            final int wbz = floor(wz);
-                            if (!this.isGlobalFluid(wbx, wby, wbz)) {
-                                continue;
-                            }
-
-                            final int colliderId = ChunkSectionData.colliderIdOf(packed);
-                            final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
-
-                            if (complex) {
-                                for (int i = 0; i < 8; i++) {
-                                    final double ox = ((i & 1) * 2 - 1) * 0.25;
-                                    final double oy = (((i >> 1) & 1) * 2 - 1) * 0.25;
-                                    final double oz = (((i >> 2) & 1) * 2 - 1) * 0.25;
-                                    this.buoyancySample(body, sb, wbx, wby, wbz,
-                                            wx + ox, wy + oy, wz + oz, 0.25,
-                                            lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                                            entry == null ? 1.0f : entry.volume);
-                                }
-                            } else {
-                                this.buoyancySample(body, sb, wbx, wby, wbz,
-                                        wx, wy, wz, 0.5,
-                                        lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                                        entry == null ? 1.0f : entry.volume);
-                            }
-                        }
+                if (complex) {
+                    for (int i = 0; i < 8; i++) {
+                        final double ox = ((i & 1) * 2 - 1) * 0.25;
+                        final double oy = (((i >> 1) & 1) * 2 - 1) * 0.25;
+                        final double oz = (((i >> 2) & 1) * 2 - 1) * 0.25;
+                        this.buoyancySample(body, sb, wbx, wby, wbz,
+                                wx + ox, wy + oy, wz + oz, 0.25,
+                                lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
+                                entry == null ? 1.0f : entry.volume);
                     }
+                } else {
+                    this.buoyancySample(body, sb, wbx, wby, wbz,
+                            wx, wy, wz, 0.5,
+                            lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
+                            entry == null ? 1.0f : entry.volume);
                 }
             }
         }
