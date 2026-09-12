@@ -59,6 +59,7 @@ import org.joml.Vector3dc;
 
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -92,6 +93,16 @@ public final class JoltPhysicsScene {
 
     public final JoltVoxelColliderData.Registry colliderRegistry = new JoltVoxelColliderData.Registry();
 
+    /**
+     * Set by the pipeline; used to lazily (re)build collision boxes of entries whose
+     * first computation yielded no boxes.
+     */
+    private volatile dev.behindthescenery.sablejolt.collider.JoltVoxelColliderBakery colliderBakery;
+
+    public void attachColliderBakery(final dev.behindthescenery.sablejolt.collider.JoltVoxelColliderBakery bakery) {
+        this.colliderBakery = bakery;
+    }
+
     private final Int2ObjectOpenHashMap<SableBody> bodies = new Int2ObjectOpenHashMap<>();
     private final Int2ObjectOpenHashMap<SableBody> bodiesByJoltId = new Int2ObjectOpenHashMap<>();
     private final Long2ObjectOpenHashMap<GlobalChunk> globalChunks = new Long2ObjectOpenHashMap<>();
@@ -100,8 +111,8 @@ public final class JoltPhysicsScene {
     private final Long2ObjectOpenHashMap<JointRecord> joints = new Long2ObjectOpenHashMap<>();
     private final Long2ObjectOpenHashMap<RopeStrand> ropes = new Long2ObjectOpenHashMap<>();
 
-    private final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<org.joml.Quaterniond> angularFollowPrev = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
-    private final it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<org.joml.Vector3d> angularCachedOmega = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+    private final Int2ObjectOpenHashMap<org.joml.Quaterniond> angularFollowPrev = new Int2ObjectOpenHashMap<>();
+    private final Int2ObjectOpenHashMap<org.joml.Vector3d> angularCachedOmega = new Int2ObjectOpenHashMap<>();
 
     public org.joml.Quaterniond getAngularFollowPrev(final int joltId) {
         return this.angularFollowPrev.get(joltId);
@@ -130,6 +141,13 @@ public final class JoltPhysicsScene {
     private final AtomicInteger nextGroupId = new AtomicInteger(1);
 
     private final ArrayList<double[]> reportedCollisions = new ArrayList<>();
+
+    /**
+     * Bodies and global chunks whose shapes must be rebuilt; block edits mark them
+     * dirty and the actual rebuild runs once per simulation step.
+     */
+    private final LinkedHashSet<SableBody> dirtyBodies = new LinkedHashSet<>();
+    private final LinkedHashSet<GlobalChunk> dirtyGlobalChunks = new LinkedHashSet<>();
 
     private GroupFilterTable mountFilter;
     private GroupFilterTableRef mountFilterRef;
@@ -182,6 +200,8 @@ public final class JoltPhysicsScene {
         this.createGround();
     }
 
+    private Body groundBody;
+
     private void createGround() {
         // The ground body MUST sit at the world origin: constraint anchors on the
         // world are measured from its center of mass, and a shifted origin would
@@ -193,6 +213,7 @@ public final class JoltPhysicsScene {
         body.setUserData(-1L);
         this.bi.addBody(body, EActivation.DontActivate);
         this.groundBodyId = body.getId();
+        this.groundBody = body;
     }
 
     public int groundBodyId() {
@@ -281,7 +302,15 @@ public final class JoltPhysicsScene {
         final int cz;
         final ChunkSectionData data;
         int joltId;
-        MutableCompoundShape shape;
+
+        /**
+         * The Java wrapper of the native body; must stay referenced for the body's
+         * whole lifetime, otherwise the jolt-jni cleaner frees the native body while
+         * the physics system still uses it.
+         */
+        Body body;
+
+        com.github.stephengold.joltjni.readonly.ConstShape shape;
         final ArrayList<Child> children = new ArrayList<>();
 
         GlobalChunk(final int cx, final int cy, final int cz, final ChunkSectionData data) {
@@ -315,8 +344,9 @@ public final class JoltPhysicsScene {
         public Constraint constraint;
     }
 
-    public static final class RopeStrand {
+    public     static final class RopeStrand {
         final ArrayList<Integer> points = new ArrayList<>();
+        final ArrayList<Body> pointBodies = new ArrayList<>();
         final ArrayList<DistanceConstraint> joints = new ArrayList<>();
         double pointRadius;
         double firstJointLength;
@@ -360,6 +390,7 @@ public final class JoltPhysicsScene {
     private void destroyBody(final SableBody sb) {
         this.bodies.remove(sb.runtimeId);
         this.bodiesByJoltId.remove(sb.joltId);
+        this.dirtyBodies.remove(sb);
         if (sb.mountId != -1) {
             final SableBody mount = this.bodies.get(sb.mountId);
             if (mount != null) {
@@ -640,11 +671,19 @@ public final class JoltPhysicsScene {
 
     //region Voxel geometry
 
-    private static boolean isSolidBlock(final int packed, final JoltVoxelColliderData entry) {
+    private boolean isSolidBlock(final int packed, final JoltVoxelColliderData entry) {
         final int colliderId = ChunkSectionData.colliderIdOf(packed);
         final int voxelState = ChunkSectionData.voxelStateOf(packed);
         // voxel states: 0=empty, 1=face, 2=edge, 3=corner, 4=interior
-        return voxelState >= 1 && voxelState <= 3 && colliderId > 0 && entry != null && entry.hasBoxes();
+        if (voxelState < 1 || voxelState > 3 || colliderId <= 0 || entry == null) {
+            return false;
+        }
+        // lazily (re)build the boxes: the first computation may have run before the
+        // block existed at its target position, yielding a registered-but-empty entry
+        if (!entry.hasBoxes()) {
+            entry.ensureBoxes(this.colliderBakery);
+        }
+        return entry.hasBoxes();
     }
 
     private void rebuildShape(final SableBody sb) {
@@ -683,11 +722,26 @@ public final class JoltPhysicsScene {
         sb.shape = shape;
         this.bi.setShape(sb.joltId, shape, false, EActivation.DontActivate);
 
-        if (JoltDebugLogging.VERBOSE) {
-            Sable.LOGGER.info("[SableJolt] rebuild body {}: kind={} allChunks={} ownChunks={} children={} hasBounds={} bounds=({},{},{})..({},{},{}) com=({},{},{})",
-                    sb.runtimeId, sb.kind, this.allChunks.size(), sb.chunks.size(), sb.children.size(), sb.hasBounds,
+        if (JoltDebugLogging.STAFF) {
+            int sectionsInWindow = 0;
+            if (sb.kind == SableBody.Kind.SUB_LEVEL && sb.hasBounds) {
+                final int cMinX = (sb.minX >> 4) - 2, cMaxX = (sb.maxX >> 4) + 2;
+                final int cMinY = (sb.minY >> 4) - 2, cMaxY = (sb.maxY >> 4) + 2;
+                final int cMinZ = (sb.minZ >> 4) - 2, cMaxZ = (sb.maxZ >> 4) + 2;
+                for (final var entry : this.allChunks.long2ObjectEntrySet()) {
+                    final long key = entry.getLongKey();
+                    final int cx = unpackChunkX(key);
+                    final int cy = unpackChunkY(key);
+                    final int cz = unpackChunkZ(key);
+                    if (cx >= cMinX && cx <= cMaxX && cy >= cMinY && cy <= cMaxY && cz >= cMinZ && cz <= cMaxZ) {
+                        sectionsInWindow++;
+                    }
+                }
+            }
+            Sable.LOGGER.info("[SableJolt] rebuild body {}: kind={} ownChunks={} children={} hasBounds={} bounds=({},{},{})..({},{},{}) com=({},{},{}) sectionsInWindow={}",
+                    sb.runtimeId, sb.kind, sb.chunks.size(), sb.children.size(), sb.hasBounds,
                     sb.minX, sb.minY, sb.minZ, sb.maxX, sb.maxY, sb.maxZ,
-                    sb.centerOfMass.x, sb.centerOfMass.y, sb.centerOfMass.z);
+                    sb.centerOfMass.x, sb.centerOfMass.y, sb.centerOfMass.z, sectionsInWindow);
         }
     }
 
@@ -697,13 +751,26 @@ public final class JoltPhysicsScene {
         final int blockMinY = cy << 4;
         final int blockMinZ = cz << 4;
 
+        String rejectLog = null;
         final Vector3d translation = new Vector3d();
         for (int bx = 0; bx < 16; bx++) {
             for (int by = 0; by < 16; by++) {
                 for (int bz = 0; bz < 16; bz++) {
                     final int packed = data.get(bx, by, bz);
                     final int colliderId = ChunkSectionData.colliderIdOf(packed);
-                    if (!isSolidBlock(packed, this.colliderRegistry.get(colliderId - 1))) {
+                    final int voxelState = ChunkSectionData.voxelStateOf(packed);
+                    final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
+                    final boolean solid = isSolidBlock(packed, entry);
+
+                    if (JoltDebugLogging.STAFF && colliderId > 0 && (!solid || !sb.contains(blockMinX + bx, blockMinY + by, blockMinZ + bz))) {
+                        final String reason = !solid
+                                ? "state=" + voxelState + (entry == null ? " entry=null" : " boxes=" + entry.boxes.size())
+                                : "outOfBounds";
+                        rejectLog = (rejectLog == null ? "" : rejectLog + "; ")
+                                + "block(" + (blockMinX + bx) + "," + (blockMinY + by) + "," + (blockMinZ + bz) + ") " + reason;
+                    }
+
+                    if (!solid) {
                         continue;
                     }
                     final int worldX = blockMinX + bx;
@@ -715,6 +782,10 @@ public final class JoltPhysicsScene {
                     this.appendBlock(sb, shape, worldX, worldY, worldZ, colliderId, translation);
                 }
             }
+        }
+
+        if (JoltDebugLogging.STAFF && rejectLog != null) {
+            Sable.LOGGER.info("[SableJolt] rebuild body {}: rejected: {}", sb.runtimeId, rejectLog);
         }
     }
 
@@ -754,18 +825,11 @@ public final class JoltPhysicsScene {
                 this.bi.removeBody(existing.joltId);
                 this.bi.destroyBody(existing.joltId);
             }
-            this.buildGlobalChunkShape(chunk);
+            this.refreshGlobalChunkBody(chunk);
             if (JoltDebugLogging.STAFF) {
                 Sable.LOGGER.info("[SableJolt] addChunk GLOBAL at ({},{},{}) children={} totalGlobal={}",
                         x, y, z, chunk.children.size(), this.globalChunks.size());
             }
-
-            final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape, RVec3.sZero(), Quat.sIdentity(), EMotionType.Static, LAYER_STATIC);
-            final Body body = this.bi.createBody(bcs);
-            body.setUserData(-1L);
-            this.bi.addBody(body, EActivation.DontActivate);
-            chunk.joltId = body.getId();
-            this.globalChunksByBodyId.put(chunk.joltId, chunk);
         } else if (ownerId != -1) {
             // Section explicitly claimed by a body (kinematic contraption upload).
             final SableBody sb = this.bodies.get(ownerId);
@@ -773,7 +837,15 @@ public final class JoltPhysicsScene {
                 sb.chunks.put(key, section);
                 this.rebuildShape(sb);
             }
+            if (JoltDebugLogging.STAFF) {
+                Sable.LOGGER.info("[SableJolt] addChunk OWNED at ({},{},{}) owner={} bodyFound={} children={}",
+                        x, y, z, ownerId, sb != null, sb != null ? sb.children.size() : -1);
+            }
         } else {
+            if (JoltDebugLogging.STAFF) {
+                Sable.LOGGER.info("[SableJolt] addChunk PLOT (no owner) at ({},{},{}) solids={}",
+                        x, y, z, countSolid(section));
+            }
             // Plot section uploaded without an owner: rebuild every sub-level whose
             // bounds cover it, mirroring the rapier shared chunk store behavior.
             for (final SableBody sb : this.bodies.values()) {
@@ -785,10 +857,55 @@ public final class JoltPhysicsScene {
                         && (cy << 4) <= sb.maxY && ((cy << 4) + 15) >= sb.minY
                         && (cz << 4) <= sb.maxZ && ((cz << 4) + 15) >= sb.minZ;
                 if (intersects) {
-                    this.rebuildShape(sb);
+                    this.markDirty(sb);
                 }
             }
         }
+    }
+
+    private static int countSolid(final ChunkSectionData section) {
+        int n = 0;
+        for (int i = 0; i < ChunkSectionData.BLOCKS; i++) {
+            if (ChunkSectionData.colliderIdOf(section.array()[i]) > 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * Marks a body's shape for rebuild; the rebuild itself is deferred to the next
+     * simulation step so bursts of block edits cost a single rebuild.
+     */
+    private void markDirty(final SableBody sb) {
+        this.dirtyBodies.add(sb);
+    }
+
+    private void flushDirty() {
+        if (!this.dirtyBodies.isEmpty()) {
+            for (final SableBody sb : this.dirtyBodies) {
+                try {
+                    this.rebuildShape(sb);
+                } catch (final Throwable t) {
+                    Sable.LOGGER.error("[SableJolt] failed to rebuild body {}", sb.runtimeId, t);
+                }
+            }
+            this.dirtyBodies.clear();
+        }
+        if (!this.dirtyGlobalChunks.isEmpty()) {
+            for (final GlobalChunk chunk : this.dirtyGlobalChunks) {
+                try {
+                    this.refreshGlobalChunkBody(chunk);
+                } catch (final Throwable t) {
+                    Sable.LOGGER.error("[SableJolt] failed to refresh global chunk ({},{},{})", chunk.cx, chunk.cy, chunk.cz, t);
+                }
+            }
+            this.dirtyGlobalChunks.clear();
+        }
+    }
+
+    public boolean hasChunk(final int sectionX, final int sectionY, final int sectionZ) {
+        return this.allChunks.containsKey(ChunkSectionData.packSectionPos(sectionX, sectionY, sectionZ));
     }
 
     public void removeChunk(final int x, final int y, final int z, final boolean global) {
@@ -818,9 +935,8 @@ public final class JoltPhysicsScene {
             if (sb.kind == SableBody.Kind.BOX || !sb.contains(x, y, z)) {
                 continue;
             }
-            // A full rebuild with a fresh shape object is required: in-place mutation
-            // of a shape already attached to a body does not refresh the broadphase.
-            this.rebuildShape(sb);
+            // batched: the actual rebuild runs once per simulation step
+            this.markDirty(sb);
             any = true;
             break;
         }
@@ -828,20 +944,23 @@ public final class JoltPhysicsScene {
         if (!any) {
             final GlobalChunk chunk = this.globalChunks.get(key);
             if (chunk != null) {
-                this.buildGlobalChunkShape(chunk);
-                this.bi.setShape(chunk.joltId, chunk.shape, false, EActivation.DontActivate);
+                this.dirtyGlobalChunks.add(chunk);
             }
         }
     }
 
     /**
-     * Rebuilds the static chunk body's compound shape from the section data with a
-     * fresh shape object.
+     * Rebuilds the static chunk body's shape from the section data. Static terrain
+     * uses a quadtree-backed static compound shape, which is dramatically faster in
+     * the narrow phase than a mutable linear compound.
      */
     private void buildGlobalChunkShape(final GlobalChunk chunk) {
-        final MutableCompoundShape shape = new MutableCompoundShape();
+        final com.github.stephengold.joltjni.StaticCompoundShapeSettings settings = new com.github.stephengold.joltjni.StaticCompoundShapeSettings();
         chunk.children.clear();
 
+        final int baseX = chunk.cx << 4;
+        final int baseY = chunk.cy << 4;
+        final int baseZ = chunk.cz << 4;
         final Vector3d translation = new Vector3d();
         for (int bx = 0; bx < 16; bx++) {
             for (int by = 0; by < 16; by++) {
@@ -856,19 +975,54 @@ public final class JoltPhysicsScene {
                     for (int i = 0; i < boxes.size(); i++) {
                         final float[] box = boxes.get(i);
                         JoltVoxelColliderData.boxCenter(box, translation);
-                        shape.addShape(
-                                new Vec3((float) ((chunk.cx << 4) + bx + translation.x),
-                                        (float) ((chunk.cy << 4) + by + translation.y),
-                                        (float) ((chunk.cz << 4) + bz + translation.z)),
+                        settings.addShape(
+                                new Vec3((float) (baseX + bx + translation.x),
+                                        (float) (baseY + by + translation.y),
+                                        (float) (baseZ + bz + translation.z)),
                                 Quat.sIdentity(),
                                 entry.shape(i));
-                        chunk.children.add(new Child((chunk.cx << 4) + bx, (chunk.cy << 4) + by, (chunk.cz << 4) + bz, colliderId));
+                        chunk.children.add(new Child(baseX + bx, baseY + by, baseZ + bz, colliderId));
                     }
                 }
             }
         }
 
-        chunk.shape = shape;
+        if (chunk.children.isEmpty()) {
+            chunk.shape = null;
+            return;
+        }
+        chunk.shape = settings.create().get();
+    }
+
+    /**
+     * Creates, updates or removes the static body of a global chunk so that it
+     * matches the chunk's current shape and data.
+     */
+    private void refreshGlobalChunkBody(final GlobalChunk chunk) {
+        this.buildGlobalChunkShape(chunk);
+
+        if (chunk.children.isEmpty()) {
+        if (chunk.joltId != 0) {
+            this.globalChunksByBodyId.remove(chunk.joltId);
+            this.bi.removeBody(chunk.joltId);
+            this.bi.destroyBody(chunk.joltId);
+            chunk.body = null;
+            chunk.joltId = 0;
+        }
+        return;
+    }
+
+        if (chunk.joltId == 0) {
+            final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape, RVec3.sZero(), Quat.sIdentity(), EMotionType.Static, LAYER_STATIC);
+            final Body body = this.bi.createBody(bcs);
+            body.setUserData(-1L);
+            this.bi.addBody(body, EActivation.DontActivate);
+            chunk.joltId = body.getId();
+            chunk.body = body;
+            this.globalChunksByBodyId.put(chunk.joltId, chunk);
+        } else {
+            this.bi.setShape(chunk.joltId, chunk.shape, false, EActivation.DontActivate);
+        }
     }
 
     /**
@@ -978,6 +1132,7 @@ public final class JoltPhysicsScene {
      * matching the cumulative effect of the rapier implementation.
      */
     public void step(final double timeStep) {
+        this.flushDirty();
         this.tickRopeAttachments();
         this.computeBuoyancy();
         this.updateContraptionMotion((float) timeStep);
@@ -1020,6 +1175,10 @@ public final class JoltPhysicsScene {
         this.allChunks.clear();
         this.joints.clear();
         this.ropes.clear();
+        this.dirtyBodies.clear();
+        this.dirtyGlobalChunks.clear();
+        this.angularFollowPrev.clear();
+        this.angularCachedOmega.clear();
     }
 
     public int nextRuntimeId() {
@@ -1305,7 +1464,16 @@ public final class JoltPhysicsScene {
         final Body body = this.bi.createBody(bcs);
         body.setUserData(-1L);
         this.bi.addBody(body, EActivation.Activate);
+        this.ropePointBodies.put(body.getId(), body);
         return body.getId();
+    }
+
+    private final Int2ObjectOpenHashMap<Body> ropePointBodies = new Int2ObjectOpenHashMap<>();
+
+    private void destroyRopePoint(final int bodyId) {
+        this.ropePointBodies.remove(bodyId);
+        this.bi.removeBody(bodyId);
+        this.bi.destroyBody(bodyId);
     }
 
     private DistanceConstraint createRopeJoint(final int joltIdA, final int joltIdB, final double length) {
@@ -1354,8 +1522,7 @@ public final class JoltPhysicsScene {
             this.removeConstraint(joint);
         }
         for (final int point : strand.points) {
-            this.bi.removeBody(point);
-            this.bi.destroyBody(point);
+            this.destroyRopePoint(point);
         }
     }
 
@@ -1410,8 +1577,7 @@ public final class JoltPhysicsScene {
         if (!strand.joints.isEmpty()) {
             this.removeConstraint(strand.joints.remove(0));
         }
-        this.bi.removeBody(point);
-        this.bi.destroyBody(point);
+        this.destroyRopePoint(point);
 
         if (!strand.joints.isEmpty()) {
             strand.joints.get(0).setDistance(0.0f, (float) strand.firstJointLength);

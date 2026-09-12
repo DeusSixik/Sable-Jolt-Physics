@@ -45,33 +45,39 @@ public class JoltVoxelColliderBakery {
         final double volume = PhysicsBlockPropertyHelper.getVolume(childState);
         final double restitution = PhysicsBlockPropertyHelper.getRestitution(childState);
         final BlockSubLevelCollisionCallback callback = BlockWithSubLevelCollisionCallback.sable$getCallback(childState);
-        final JoltVoxelColliderData entry = this.registry.create(friction, volume, restitution, liquid, callback);
+        final JoltVoxelColliderData entry = this.registry.create(friction, volume, restitution, liquid, callback, childState);
 
         if (liquid) {
             entry.addBox(JOMLConversion.ZERO, new Vector3d(1.0, 1.0, 1.0));
-            return entry;
+        } else {
+            this.buildBoxesInto(entry, childState);
+        }
+        return entry;
+    }
+
+    /**
+     * (Re)computes the collision boxes of an entry from its block state. Called at
+     * creation and lazily on demand: the first computation can legitimately yield
+     * no boxes when it runs before the block exists at its target position.
+     */
+    public void buildBoxesInto(final JoltVoxelColliderData entry, final BlockState state) {
+        if (entry.isFluid) {
+            return;
         }
 
         final VoxelShape shape;
-
-        this.level.setup(childState);
-        if (childState.getBlock() instanceof final BlockSubLevelCollisionShape extension) {
-            shape = extension.getSubLevelCollisionShape(this.level, childState);
+        this.level.setup(state);
+        if (state.getBlock() instanceof final BlockSubLevelCollisionShape extension) {
+            shape = extension.getSubLevelCollisionShape(this.level, state);
         } else {
-            shape = childState.getCollisionShape(this.level, BlockPos.ZERO, SableCollisionContext.get());
+            shape = state.getCollisionShape(this.level, BlockPos.ZERO, SableCollisionContext.get());
         }
         this.level.setup(Blocks.AIR.defaultBlockState());
-
-        if (shape.isEmpty()) {
-            return null;
-        }
 
         shape.forAllBoxes((minX, minY, minZ, maxX, maxY, maxZ) -> entry.addBox(
                 new Vector3d(Math.max(minX, 0.0), Math.max(minY, 0.0), Math.max(minZ, 0.0)),
                 new Vector3d(Math.min(maxX, 1.0), Math.min(maxY, 1.0), Math.min(maxZ, 1.0))
         ));
-
-        return entry;
     }
 
     /**

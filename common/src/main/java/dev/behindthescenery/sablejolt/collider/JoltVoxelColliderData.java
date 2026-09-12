@@ -2,8 +2,10 @@ package dev.behindthescenery.sablejolt.collider;
 
 import com.github.stephengold.joltjni.Vec3;
 import com.github.stephengold.joltjni.readonly.ConstShape;
+import dev.ryanhcode.sable.api.block.BlockSubLevelCollisionShape;
 import dev.ryanhcode.sable.api.physics.callback.BlockSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.collider.VoxelColliderData;
+import net.minecraft.world.level.block.state.BlockState;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
@@ -29,17 +31,24 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
     @Nullable public final BlockSubLevelCollisionCallback contactEvents;
 
     /**
+     * The block state this data was built for; used to (re)build boxes lazily.
+     */
+    @Nullable public final BlockState sourceState;
+
+    /**
      * Lazily built shared shapes, one per box index, reused by every body.
      */
     private volatile ConstShape[] shapes;
 
     JoltVoxelColliderData(final double frictionMultiplier, final double volume, final double restitution,
-                          final boolean isFluid, @Nullable final BlockSubLevelCollisionCallback contactEvents) {
+                          final boolean isFluid, @Nullable final BlockSubLevelCollisionCallback contactEvents,
+                          @Nullable final BlockState sourceState) {
         this.frictionMultiplier = (float) frictionMultiplier;
         this.volume = (float) volume;
         this.restitution = (float) restitution;
         this.isFluid = isFluid;
         this.contactEvents = contactEvents;
+        this.sourceState = sourceState;
     }
 
     public boolean needsSpecialContacts() {
@@ -48,6 +57,18 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
     public boolean hasBoxes() {
         return !this.boxes.isEmpty();
+    }
+
+    /**
+     * Ensures the collision boxes have been computed. The box computation can run
+     * before the block actually exists at its plot/world position, producing an
+     * empty (but registered) entry; it is retried on demand here.
+     */
+    public synchronized void ensureBoxes(@Nullable final JoltVoxelColliderBakery owner) {
+        if (this.isFluid || !this.boxes.isEmpty() || this.sourceState == null || owner == null) {
+            return;
+        }
+        owner.buildBoxesInto(this, this.sourceState);
     }
 
     /**
@@ -98,8 +119,9 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
         public synchronized JoltVoxelColliderData create(final double frictionMultiplier, final double volume,
                                                          final double restitution, final boolean isFluid,
-                                                         @Nullable final BlockSubLevelCollisionCallback contactEvents) {
-            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents);
+                                                         @Nullable final BlockSubLevelCollisionCallback contactEvents,
+                                                         @Nullable final BlockState sourceState) {
+            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState);
             this.entries.add(data);
             return data;
         }

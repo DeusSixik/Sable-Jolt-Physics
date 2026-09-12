@@ -123,6 +123,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     public void init(@Nullable final Vector3dc gravity, final double universalDrag) {
         this.scene = new JoltPhysicsScene(gravity.x(), gravity.y(), gravity.z(), universalDrag);
         this.colliderBakery = new JoltVoxelColliderBakery(this.level, this.scene.colliderRegistry);
+        this.scene.attachColliderBakery(this.colliderBakery);
     }
 
     /**
@@ -431,6 +432,15 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         y = (sectionPos.y() << 4) + y;
         z = (sectionPos.z() << 4) + z;
 
+        // Self-heal: if Sable believes a world section is already uploaded but we lost
+        // it (e.g., it was removed while out of physics range and never re-added),
+        // re-read it from the live level so block edits keep colliding.
+        this.ensureWorldSection(x >> 4, y >> 4, z >> 4);
+        for (final Direction dir : Direction.values()) {
+            final BlockPos pos = globalBlockPosOrSelf(x, y, z, dir);
+            this.ensureWorldSection(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
+        }
+
         final BlockPos globalBlockPos = new BlockPos(x, y, z);
 
         for (final Direction dir : Direction.values()) {
@@ -447,6 +457,55 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
         final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
         this.scene().changeBlock(x, y, z, packBlockState(state, colliderValue));
+    }
+
+    private static BlockPos globalBlockPosOrSelf(final int x, final int y, final int z, final Direction dir) {
+        return new BlockPos(x, y, z).relative(dir);
+    }
+
+    /**
+     * Re-reads a world section from the live level into the physics scene if it is a
+     * global (non-plot) loaded section that the scene currently lacks.
+     */
+    private void ensureWorldSection(final int sx, final int sy, final int sz) {
+        if (this.scene().hasChunk(sx, sy, sz)) {
+            return;
+        }
+        final ServerSubLevelContainer container = ServerSubLevelContainer.getContainer(this.level);
+        if (container != null && container.getPlot(sx, sz) != null) {
+            return;
+        }
+
+        final SectionPos sectionPos = SectionPos.of(sx, sy, sz);
+        if (!this.level.hasChunkAt(sectionPos.center())) {
+            return;
+        }
+
+        final int[] array = new int[LevelChunkSection.SECTION_SIZE];
+        boolean anySolid = false;
+        for (int bx = 0; bx < 16; bx++) {
+            for (int bz = 0; bz < 16; bz++) {
+                for (int by = 0; by < 16; by++) {
+                    final BlockPos globalPos = new BlockPos(bx, by, bz).offset(sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ());
+                    final BlockState blockState = this.level.getBlockState(globalPos);
+                    if (blockState.isAir()) {
+                        continue;
+                    }
+                    anySolid = true;
+
+                    final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
+                    final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
+
+                    final int index = bx + (bz << 4) + (by << 8);
+                    final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
+                    array[index] = packBlockState(state, colliderValue);
+                }
+            }
+        }
+
+        if (anySolid) {
+            this.scene().addChunk(sx, sy, sz, array, true, -1);
+        }
     }
 
     @Override
