@@ -189,6 +189,10 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final int id = subLevel.getRuntimeId();
         this.scene().createSubLevel(id, new double[]{pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()});
 
+        // Guarantee terrain collision at the assembly point even if Sable's chunk
+        // tickets have not uploaded the world sections there yet.
+        this.uploadWorldSectionsAround(pos);
+
         subLevel.updateMergedMassData(1.0f);
         final Vector3dc centerOfMass = subLevel.getMassTracker().getCenterOfMass();
 
@@ -198,6 +202,59 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         }
 
         this.activeSubLevels.put(id, subLevel);
+    }
+
+    /**
+     * Uploads world terrain sections in a 3x3x3 section cube around the assembly
+     * point into the physics scene (skipping plot sections).
+     */
+    private void uploadWorldSectionsAround(final Vector3dc pos) {
+        final ServerSubLevelContainer container = ServerSubLevelContainer.getContainer(this.level);
+        if (container == null) {
+            return;
+        }
+
+        final BlockPos center = BlockPos.containing(pos.x(), pos.y(), pos.z());
+        final SectionPos centerSection = SectionPos.of(center);
+        final int minSectionY = this.level.getMinSection();
+        final int maxSectionY = this.level.getMaxSection() - 1;
+
+        for (int x = centerSection.x() - 1; x <= centerSection.x() + 1; x++) {
+            for (int z = centerSection.z() - 1; z <= centerSection.z() + 1; z++) {
+                if (container.getPlot(x, z) != null) {
+                    continue;
+                }
+                for (int y = Math.max(centerSection.y() - 1, minSectionY); y <= Math.min(centerSection.y() + 1, maxSectionY); y++) {
+                    final SectionPos sectionPos = SectionPos.of(x, y, z);
+                    final int[] array = new int[LevelChunkSection.SECTION_SIZE];
+
+                    boolean anySolid = false;
+                    for (int bx = 0; bx < 16; bx++) {
+                        for (int bz = 0; bz < 16; bz++) {
+                            for (int by = 0; by < 16; by++) {
+                                final BlockPos globalPos = new BlockPos(bx, by, bz).offset(sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ());
+                                final BlockState blockState = this.level.getBlockState(globalPos);
+                                if (blockState.isAir()) {
+                                    continue;
+                                }
+                                anySolid = true;
+
+                                final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
+                                final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
+
+                                final int index = bx + (bz << 4) + (by << 8);
+                                final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
+                                array[index] = packBlockState(state, colliderValue);
+                            }
+                        }
+                    }
+
+                    if (anySolid) {
+                        this.scene().addChunk(x, y, z, array, true, -1);
+                    }
+                }
+            }
+        }
     }
 
     /**

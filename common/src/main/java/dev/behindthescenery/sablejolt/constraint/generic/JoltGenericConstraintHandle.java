@@ -13,6 +13,7 @@ import com.github.stephengold.joltjni.enumerate.EMotorState;
 import com.github.stephengold.joltjni.enumerate.ESpringMode;
 import dev.behindthescenery.sablejolt.JoltPhysicsScene;
 import dev.behindthescenery.sablejolt.constraint.JoltConstraintHandle;
+import dev.behindthescenery.sablejolt.constraint.SixDofMotors;
 import dev.behindthescenery.sablejolt.constraint.fixed.JoltFixedConstraintHandle;
 import dev.ryanhcode.sable.api.physics.PhysicsPipelineBody;
 import dev.ryanhcode.sable.api.physics.constraint.ConstraintJointAxis;
@@ -109,6 +110,8 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
     private JoltPhysicsScene.SableBody sbB;
     private int joltA;
     private int joltB;
+    private final SixDofMotors.MotorParams[] motors = new SixDofMotors.MotorParams[SixDofMotors.AXIS_COUNT];
+    private com.github.stephengold.joltjni.SixDofConstraintSettings ownSettings;
 
     private JoltGenericConstraintHandle(final JoltPhysicsScene scene, final long handle) {
         super(scene);
@@ -224,12 +227,19 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
         final SixDofConstraint constraint = (SixDofConstraint) this.scene.createConstraint(settings, this.joltA, this.joltB);
         record.constraint = constraint;
         record.genericSettings = settings;
+        this.ownSettings = settings;
 
         for (int i = 0; i < 6; i++) {
             if (record.limits[i][1] > record.limits[i][0] && !record.locked[i]) {
                 applyLimits(constraint, i, record.limits[i][0], record.limits[i][1]);
             } else if (record.locked[i]) {
                 applyLimits(constraint, i, 0.0, 0.0);
+            }
+        }
+
+        for (int i = 0; i < 6; i++) {
+            if (this.motors[i] != null) {
+                SixDofMotors.applyMotor(constraint, this.ownSettings, i, this.motors, this.scene, record.joltIdA, record.joltIdB, this.rotA);
             }
         }
     }
@@ -245,31 +255,7 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
             return;
         }
 
-        final EAxis axis = EAxis.values()[axisOrdinal];
-        constraint.setMotorState(axis, EMotorState.Position);
-
-        final MotorSettings motor = constraint.getMotorSettings(axis);
-        final SpringSettings spring = motor.getSpringSettings();
-        spring.setMode(ESpringMode.StiffnessAndDamping);
-        spring.setStiffness((float) stiffness);
-        spring.setDamping((float) damping);
-        if (hasForceLimit) {
-            motor.setForceLimit((float) maxForce);
-            motor.setTorqueLimit((float) maxForce);
-        }
-
-        if (axisOrdinal < 3) {
-            final float[] targetArr = new float[3];
-            targetArr[axisOrdinal] = (float) target;
-            constraint.setTargetPositionCs(new Vec3(targetArr[0], targetArr[1], targetArr[2]));
-        } else {
-            final int i = axisOrdinal - 3;
-            final Vec3 axisVector = switch (i) {
-                case 0 -> Vec3.sAxisX();
-                case 1 -> Vec3.sAxisY();
-                default -> Vec3.sAxisZ();
-            };
-            constraint.setTargetOrientationCs(Quat.sRotation(axisVector, (float) target));
-        }
+        this.motors[axisOrdinal] = new SixDofMotors.MotorParams(target, stiffness, damping, hasForceLimit, maxForce);
+        SixDofMotors.applyMotor(constraint, this.ownSettings, axisOrdinal, this.motors, this.scene, record.joltIdA, record.joltIdB, this.rotA);
     }
 }

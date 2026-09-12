@@ -1,8 +1,8 @@
 package dev.behindthescenery.sablejolt.constraint;
 
 import dev.behindthescenery.sablejolt.JoltPhysicsScene;
-import dev.ryanhcode.sable.api.physics.constraint.ConstraintJointAxis;
-import org.jetbrains.annotations.ApiStatus;
+import dev.behindthescenery.sablejolt.constraint.StaffDebug;
+import dev.ryanhcode.sable.api.physics.constraint.ConstraintJointAxis;import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
 
@@ -43,6 +43,7 @@ public abstract class JoltConstraintHandle {
 
     public void remove() {
         if (this.handle != -1) {
+            StaffDebug.constraintRemoved();
             this.scene.removeJoint(this.handle);
             this.handle = -1;
         }
