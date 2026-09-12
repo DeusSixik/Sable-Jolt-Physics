@@ -1,44 +1,6 @@
 package dev.behindthescenery.sablejolt;
 
-import com.github.stephengold.joltjni.Body;
-import com.github.stephengold.joltjni.BodyCreationSettings;
-import com.github.stephengold.joltjni.BodyInterface;
-import com.github.stephengold.joltjni.Constraint;
-import com.github.stephengold.joltjni.ContactListener;
-import com.github.stephengold.joltjni.ContactManifold;
-import com.github.stephengold.joltjni.ContactSettings;
-import com.github.stephengold.joltjni.CustomContactListener;
-import com.github.stephengold.joltjni.DistanceConstraint;
-import com.github.stephengold.joltjni.DistanceConstraintSettings;
-import com.github.stephengold.joltjni.FixedConstraintSettings;
-import com.github.stephengold.joltjni.HingeConstraint;
-import com.github.stephengold.joltjni.HingeConstraintSettings;
-import com.github.stephengold.joltjni.JobSystem;
-import com.github.stephengold.joltjni.JobSystemThreadPool;
-import com.github.stephengold.joltjni.Jolt;
-import com.github.stephengold.joltjni.Mat44;
-import com.github.stephengold.joltjni.MassProperties;
-import com.github.stephengold.joltjni.MotorSettings;
-import com.github.stephengold.joltjni.MutableCompoundShape;
-import com.github.stephengold.joltjni.PhysicsSystem;
-import com.github.stephengold.joltjni.PointConstraintSettings;
-import com.github.stephengold.joltjni.Quat;
-import com.github.stephengold.joltjni.RVec3;
-import com.github.stephengold.joltjni.SixDofConstraint;
-import com.github.stephengold.joltjni.SixDofConstraintSettings;
-import com.github.stephengold.joltjni.SpringSettings;
-import com.github.stephengold.joltjni.TempAllocator;
-import com.github.stephengold.joltjni.TempAllocatorMalloc;
-import com.github.stephengold.joltjni.TwoBodyConstraint;
-import com.github.stephengold.joltjni.TwoBodyConstraintSettings;
-import com.github.stephengold.joltjni.Vec3;
-import com.github.stephengold.joltjni.BroadPhaseLayerInterfaceTable;
-import com.github.stephengold.joltjni.ObjectLayerPairFilterTable;
-import com.github.stephengold.joltjni.ObjectVsBroadPhaseLayerFilterTable;
-import com.github.stephengold.joltjni.CollisionGroup;
-import com.github.stephengold.joltjni.GroupFilterTable;
-import com.github.stephengold.joltjni.GroupFilterTableRef;
-import com.github.stephengold.joltjni.BodyIdVector;
+import com.github.stephengold.joltjni.*;
 import com.github.stephengold.joltjni.enumerate.EActivation;
 import com.github.stephengold.joltjni.enumerate.EAxis;
 import com.github.stephengold.joltjni.enumerate.EMotionQuality;
@@ -50,6 +12,7 @@ import dev.behindthescenery.sablejolt.collider.JoltVoxelColliderData;
 import dev.ryanhcode.sable.Sable;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Quaterniond;
@@ -61,6 +24,8 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -89,6 +54,15 @@ public final class JoltPhysicsScene {
     }
     private final TempAllocator tempAllocator;
     private final JobSystem jobSystem;
+    private final JobSystem singleThreadJobSystem;
+    private static final int WORKER_THREADS = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+    private final java.util.concurrent.ExecutorService bodyWorkers = java.util.concurrent.Executors.newFixedThreadPool(
+            WORKER_THREADS, r -> {
+                final Thread t = new Thread(r, "sable-jolt-worker");
+                t.setDaemon(true);
+                return t;
+            });
+    private static final int MULTITHREAD_BODY_THRESHOLD = 24;
     private final ContactListener contactListener;
 
     public final JoltVoxelColliderData.Registry colliderRegistry = new JoltVoxelColliderData.Registry();
@@ -143,6 +117,12 @@ public final class JoltPhysicsScene {
     private final ArrayList<double[]> reportedCollisions = new ArrayList<>();
 
     /**
+     * Guards reportedCollisions: Jolt fires contact callbacks from worker threads
+     * when the solver runs multithreaded.
+     */
+    private final Object reportedLock = new Object();
+
+    /**
      * Bodies and global chunks whose shapes must be rebuilt; block edits mark them
      * dirty and the actual rebuild runs once per simulation step.
      */
@@ -192,6 +172,7 @@ public final class JoltPhysicsScene {
         this.bi = this.system.getBodyInterface();
         this.tempAllocator = new TempAllocatorMalloc();
         this.jobSystem = new JobSystemThreadPool(Jolt.cMaxPhysicsJobs, Jolt.cMaxPhysicsBarriers, Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
+        this.singleThreadJobSystem = new JobSystemSingleThreaded(Jolt.cMaxPhysicsJobs);
 
         this.mountFilterRef = this.mountFilter.toRef();
         this.contactListener = new SceneContactListener();
@@ -923,11 +904,22 @@ public final class JoltPhysicsScene {
 
     private void flushDirty() {
         if (!this.dirtyBodies.isEmpty()) {
-            for (final SableBody sb : this.dirtyBodies) {
-                try {
-                    this.rebuildShape(sb);
-                } catch (final Throwable t) {
-                    Sable.LOGGER.error("[SableJolt] failed to rebuild body {}", sb.runtimeId, t);
+            final var list = new ArrayList<>(this.dirtyBodies);
+            if (list.size() >= 8) {
+                this.runParallel(list, sb -> {
+                    try {
+                        this.rebuildShape(sb);
+                    } catch (final Throwable t) {
+                        Sable.LOGGER.error("[SableJolt] failed to rebuild body {}", sb.runtimeId, t);
+                    }
+                });
+            } else {
+                for (final SableBody sb : list) {
+                    try {
+                        this.rebuildShape(sb);
+                    } catch (final Throwable t) {
+                        Sable.LOGGER.error("[SableJolt] failed to rebuild body {}", sb.runtimeId, t);
+                    }
                 }
             }
             this.dirtyBodies.clear();
@@ -955,6 +947,7 @@ public final class JoltPhysicsScene {
 
         if (global) {
             final GlobalChunk chunk = this.globalChunks.remove(key);
+            this.fluidSections.remove(key);
             if (chunk != null && chunk.joltId != 0) {
                 this.globalChunksByBodyId.remove(chunk.joltId);
                 this.bi.removeBody(chunk.joltId);
@@ -1004,6 +997,7 @@ public final class JoltPhysicsScene {
         final int baseY = chunk.cy << 4;
         final int baseZ = chunk.cz << 4;
         final Vector3d translation = new Vector3d();
+        boolean anyFluid = false;
         for (int bx = 0; bx < 16; bx++) {
             for (int by = 0; by < 16; by++) {
                 for (int bz = 0; bz < 16; bz++) {
@@ -1013,6 +1007,7 @@ public final class JoltPhysicsScene {
                         continue;
                     }
                     final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
+                    anyFluid |= entry.isFluid;
                     final List<float[]> boxes = entry.boxes;
                     for (int i = 0; i < boxes.size(); i++) {
                         final float[] box = boxes.get(i);
@@ -1027,6 +1022,12 @@ public final class JoltPhysicsScene {
                     }
                 }
             }
+        }
+
+        if (anyFluid) {
+            this.fluidSections.add(ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz));
+        } else {
+            this.fluidSections.remove(ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz));
         }
 
         if (chunk.children.isEmpty()) {
@@ -1071,7 +1072,11 @@ public final class JoltPhysicsScene {
      * Checks whether the given world block position holds a global fluid block.
      */
     boolean isGlobalFluid(final int x, final int y, final int z) {
-        final GlobalChunk chunk = this.globalChunks.get(ChunkSectionData.packSectionPos(x >> 4, y >> 4, z >> 4));
+        final long sectionKey = ChunkSectionData.packSectionPos(x >> 4, y >> 4, z >> 4);
+        if (!this.fluidSections.contains(sectionKey)) {
+            return false;
+        }
+        final GlobalChunk chunk = this.globalChunks.get(sectionKey);
         if (chunk == null) {
             return false;
         }
@@ -1135,10 +1140,22 @@ public final class JoltPhysicsScene {
     private final it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap mountGroupIds = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
 
     /**
+     * Section keys of global chunks that contain at least one fluid block; buoyancy
+     * is skipped entirely when empty.
+     */
+    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet fluidSections = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
+
+    /**
      * Bumped whenever any chunk section data changes; used to invalidate the
      * per-body shape rebuild dedup.
      */
     private long chunkDataVersion;
+
+    /**
+     * Reusable jolt-jni wrappers for the per-substep hot paths (server thread only):
+     * avoids native allocations and cleaner churn.
+     */
+    private JobSystem activeJobSystem;
 
     public void removeKinematicContraption(final int id) {
         final SableBody sb = this.bodies.get(id);
@@ -1184,9 +1201,58 @@ public final class JoltPhysicsScene {
         this.tickRopeAttachments();
         this.computeBuoyancy();
         this.updateContraptionMotion((float) timeStep);
-        this.system.update((float) timeStep, 1, this.tempAllocator, this.jobSystem);
+        // small scenes: a single-threaded job system avoids the wake/sync overhead
+        // of the thread pool, which dominates when the solver has almost no work
+        final JobSystem jobs = this.bodies.size() >= MULTITHREAD_BODY_THRESHOLD
+                ? this.jobSystem : this.singleThreadJobSystem;
+        this.system.update((float) timeStep, 1, this.tempAllocator, jobs);
         if (JoltDebugLogging.STAFF) {
             this.staffWorldDump();
+        }
+    }
+
+    /**
+     * Splits per-body work into slices for the worker pool. The calling thread
+     * processes the first slice and the method returns after all slices finish.
+     */
+    private void runParallel(final List<SableBody> bodies, final java.util.function.Consumer<SableBody> action) {
+        final int workers = Math.min(WORKER_THREADS, bodies.size());
+        if (workers <= 1) {
+            for (final SableBody sb : bodies) {
+                action.accept(sb);
+            }
+            return;
+        }
+
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(workers - 1);
+        final int sliceSize = (bodies.size() + workers - 1) / workers;
+        for (int w = 1; w < workers; w++) {
+            final int from = w * sliceSize;
+            final int to = Math.min(bodies.size(), from + sliceSize);
+            if (from >= to) {
+                break;
+            }
+            final List<SableBody> slice = bodies.subList(from, to);
+            this.bodyWorkers.submit(() -> {
+                try {
+                    for (final SableBody sb : slice) {
+                        action.accept(sb);
+                    }
+                } catch (final Throwable t) {
+                    Sable.LOGGER.error("[SableJolt] parallel body task failed", t);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        final int headEnd = Math.min(sliceSize, bodies.size());
+        for (final SableBody sb : bodies.subList(0, headEnd)) {
+            action.accept(sb);
+        }
+        try {
+            latch.await();
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -1200,6 +1266,7 @@ public final class JoltPhysicsScene {
         this.lastWorldDump = now;
 
         final StringBuilder sb = new StringBuilder("[SableJolt:staff] world: globalChunks=").append(this.globalChunks.size())
+                .append(" fluidSections=").append(this.fluidSections.size())
                 .append(" allChunks=").append(this.allChunks.size())
                 .append(" bodies=").append(this.bodies.size());
         for (final SableBody body : this.bodies.values()) {
@@ -1225,8 +1292,11 @@ public final class JoltPhysicsScene {
         this.ropes.clear();
         this.dirtyBodies.clear();
         this.dirtyGlobalChunks.clear();
+        this.fluidSections.clear();
         this.angularFollowPrev.clear();
         this.angularCachedOmega.clear();
+        this.ropePointBodies.clear();
+        this.mountGroupIds.clear();
     }
 
     public int nextRuntimeId() {
@@ -1238,76 +1308,95 @@ public final class JoltPhysicsScene {
     //region Buoyancy (ported from buoyancy.rs)
 
     private void computeBuoyancy() {
-        if (this.globalChunks.isEmpty()) {
+        if (this.fluidSections.isEmpty()) {
             return;
         }
 
+        final ArrayList<SableBody> active = new ArrayList<>();
         for (final SableBody sb : this.bodies.values()) {
-            if (sb.kind != SableBody.Kind.SUB_LEVEL || !sb.hasBounds || sb.children.isEmpty()) {
-                continue;
-            }
-
-            final Body body = sb.body;
-            if (!body.isActive()) {
-                continue;
-            }
-
-            final RVec3 comPos = body.getCenterOfMassPosition();
-            final double comX = comPos.xx(), comY = comPos.yy(), comZ = comPos.zz();
-            final Quat rot = body.getRotation();
-            final Vec3 lin = body.getLinearVelocity();
-            final Vec3 ang = body.getAngularVelocity();
-            final float lvx = lin.getX(), lvy = lin.getY(), lvz = lin.getZ();
-            final float avx = ang.getX(), avy = ang.getY(), avz = ang.getZ();
-
-            final int sizeSum = (sb.maxX - sb.minX) + (sb.maxY - sb.minY) + (sb.maxZ - sb.minZ);
-            final boolean complex = sizeSum < 10;
-
-            // Iterate the body's own collider blocks (already rebuilt and bounds-filtered
-            // in sb.children) instead of rescanning chunk section data.
-            for (final Child c : sb.children) {
-                final double lpx = c.bx + 0.5 - sb.centerOfMass.x;
-                final double lpy = c.by + 0.5 - sb.centerOfMass.y;
-                final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
-
-                final Vec3 local = new Vec3((float) lpx, (float) lpy, (float) lpz);
-                final Vec3 worldOffset = rotate(local, rot);
-                final double wx = comX + worldOffset.getX();
-                final double wy = comY + worldOffset.getY();
-                final double wz = comZ + worldOffset.getZ();
-
-                final int wbx = floor(wx);
-                final int wby = floor(wy);
-                final int wbz = floor(wz);
-                if (!this.isGlobalFluid(wbx, wby, wbz)) {
-                    continue;
+            if (sb.kind == SableBody.Kind.SUB_LEVEL && sb.hasBounds && !sb.children.isEmpty()) {
+                final Body body = sb.body;
+                if (body.isActive()) {
+                    active.add(sb);
                 }
+            }
+        }
+        if (active.isEmpty()) {
+            return;
+        }
 
-                final JoltVoxelColliderData entry = this.colliderRegistry.get(c.colliderId - 1);
-
-                if (complex) {
-                    for (int i = 0; i < 8; i++) {
-                        final double ox = ((i & 1) * 2 - 1) * 0.25;
-                        final double oy = (((i >> 1) & 1) * 2 - 1) * 0.25;
-                        final double oz = (((i >> 2) & 1) * 2 - 1) * 0.25;
-                        this.buoyancySample(body, sb, wbx, wby, wbz,
-                                wx + ox, wy + oy, wz + oz, 0.25,
-                                lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                                entry == null ? 1.0f : entry.volume);
-                    }
-                } else {
-                    this.buoyancySample(body, sb, wbx, wby, wbz,
-                            wx, wy, wz, 0.5,
-                            lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                            entry == null ? 1.0f : entry.volume);
-                }
+        if (active.size() >= 12) {
+            this.runParallel(active, this::buoyancyForBody);
+        } else {
+            for (final SableBody sb : active) {
+                this.buoyancyForBody(sb);
             }
         }
     }
 
+    private void buoyancyForBody(final SableBody sb) {
+        final Body body = sb.body;
+
+        final RVec3 comPos = body.getCenterOfMassPosition();
+        final double comX = comPos.xx(), comY = comPos.yy(), comZ = comPos.zz();
+        final Quat rot = body.getRotation();
+        final Vec3 lin = body.getLinearVelocity();
+        final Vec3 ang = body.getAngularVelocity();
+        final float lvx = lin.getX(), lvy = lin.getY(), lvz = lin.getZ();
+        final float avx = ang.getX(), avy = ang.getY(), avz = ang.getZ();
+
+        final int sizeSum = (sb.maxX - sb.minX) + (sb.maxY - sb.minY) + (sb.maxZ - sb.minZ);
+        final boolean complex = sizeSum < 10;
+
+        // Iterate the body's own collider blocks (already rebuilt and bounds-filtered
+        // in sb.children) instead of rescanning chunk section data.
+        for (final Child c : sb.children) {
+            final double lpx = c.bx + 0.5 - sb.centerOfMass.x;
+            final double lpy = c.by + 0.5 - sb.centerOfMass.y;
+            final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
+
+            final Vec3 local = new Vec3((float) lpx, (float) lpy, (float) lpz);
+            final Vec3 worldOffset = rotate(local, rot);
+            final double wx = comX + worldOffset.getX();
+            final double wy = comY + worldOffset.getY();
+            final double wz = comZ + worldOffset.getZ();
+
+            final int wbx = floor(wx);
+            final int wby = floor(wy);
+            final int wbz = floor(wz);
+            if (!this.isGlobalFluid(wbx, wby, wbz)) {
+                continue;
+            }
+
+            final JoltVoxelColliderData entry = this.colliderRegistry.get(c.colliderId - 1);
+
+            if (complex) {
+                for (int i = 0; i < 8; i++) {
+                    final double ox = ((i & 1) * 2 - 1) * 0.25;
+                    final double oy = (((i >> 1) & 1) * 2 - 1) * 0.25;
+                    final double oz = (((i >> 2) & 1) * 2 - 1) * 0.25;
+                    this.buoyancySample(body, sb, wbx, wby, wbz,
+                            wx + ox, wy + oy, wz + oz, 0.25,
+                            lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
+                            entry == null ? 1.0f : entry.volume);
+                }
+            } else {
+                this.buoyancySample(body, sb, wbx, wby, wbz,
+                        wx, wy, wz, 0.5,
+                        lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
+                        entry == null ? 1.0f : entry.volume);
+            }
+        }
+    }
     private static int floor(final double v) {
         return (int) Math.floor(v);
     }
+
+    // Reusable wrappers for per-substep hot paths (server thread only).
+    // Reusable wrappers for the buoyancy hot path; ThreadLocal because the servo
+    // work is distributed across worker threads.
+    private final ThreadLocal<Vec3> tmpForce = ThreadLocal.withInitial(Vec3::new);
+    private final ThreadLocal<RVec3> tmpPoint = ThreadLocal.withInitial(RVec3::new);
 
     private void buoyancySample(final Body body, final SableBody sb, final int wbx, final int wby, final int wbz,
                                 final double px, final double py, final double pz, final double half,
@@ -1327,19 +1416,22 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final RVec3 point = new RVec3(px, py, pz);
+        final RVec3 tmpPoint = this.tmpPoint.get();
+        tmpPoint.set(px, py, pz);
+        final Vec3 tmpForce = this.tmpForce.get();
 
         // drag: F = -v * 1.7 * volume
         final double rx = px - comX, ry = py - comY, rz = pz - comZ;
         final double vx = lvx + avy * rz - avz * ry;
         final double vy = lvy + avz * rx - avx * rz;
         final double vz = lvz + avx * ry - avy * rx;
-        body.addForce(new Vec3((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume)), point);
+        tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
+        body.addForce(tmpForce, tmpPoint);
 
         // float: F = (0, 10.5 * volume * fluidVolume, 0)
-        body.addForce(new Vec3(0.0f, (float) (10.5 * volume * fluidVolume), 0.0f), point);
+        tmpForce.set(0.0f, (float) (10.5 * volume * fluidVolume), 0.0f);
+        body.addForce(tmpForce, tmpPoint);
     }
-
     //endregion
 
     //region Contraption motion
@@ -1402,24 +1494,33 @@ public final class JoltPhysicsScene {
      * Each collision is formatted as:
      * [body_a, body_b, force_amount, local_normal_a, local_normal_b, local_point_a, local_point_b]
      */
+    /**
+     * Reads & clears all reported collisions.
+     * Each collision is formatted as:
+     * [body_a, body_b, force_amount, local_normal_a, local_normal_b, local_point_a, local_point_b]
+     */
     public double[] clearCollisions() {
         final int max = 100;
-        if (this.reportedCollisions.size() > max) {
-            this.reportedCollisions.subList(max, this.reportedCollisions.size()).clear();
+        final double[] arr;
+        synchronized (this.reportedLock) {
+            if (this.reportedCollisions.size() > max) {
+                this.reportedCollisions.subList(max, this.reportedCollisions.size()).clear();
+            }
+            arr = new double[this.reportedCollisions.size() * 15];
+            int i = 0;
+            for (final double[] rec : this.reportedCollisions) {
+                System.arraycopy(rec, 0, arr, i, 15);
+                i += 15;
+            }
+            this.reportedCollisions.clear();
         }
-
-        final double[] arr = new double[this.reportedCollisions.size() * 15];
-        int i = 0;
-        for (final double[] rec : this.reportedCollisions) {
-            System.arraycopy(rec, 0, arr, i, 15);
-            i += 15;
-        }
-        this.reportedCollisions.clear();
         return arr;
     }
 
     void reportCollision(final double[] rec) {
-        this.reportedCollisions.add(rec);
+        synchronized (this.reportedLock) {
+            this.reportedCollisions.add(rec);
+        }
     }
 
     JoltVoxelColliderData.Registry registry() {

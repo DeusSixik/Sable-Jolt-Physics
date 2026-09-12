@@ -1,5 +1,6 @@
 package dev.behindthescenery.sablejolt.collider;
 
+import com.github.stephengold.joltjni.BoxShape;
 import com.github.stephengold.joltjni.Vec3;
 import com.github.stephengold.joltjni.readonly.ConstShape;
 import dev.ryanhcode.sable.api.block.BlockSubLevelCollisionShape;
@@ -88,7 +89,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
                     final float hx = Math.max((b[3] - b[0]) * 0.5f, 0.0001f);
                     final float hy = Math.max((b[4] - b[1]) * 0.5f, 0.0001f);
                     final float hz = Math.max((b[5] - b[2]) * 0.5f, 0.0001f);
-                    arr[boxIndex] = new com.github.stephengold.joltjni.BoxShape(new Vec3(hx, hy, hz), 0.025f);
+                    arr[boxIndex] = new BoxShape(new Vec3(hx, hy, hz), 0.025f);
                 }
             }
         }

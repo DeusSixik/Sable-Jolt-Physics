@@ -60,7 +60,7 @@ public class JoltVoxelColliderBakery {
      * creation and lazily on demand: the first computation can legitimately yield
      * no boxes when it runs before the block exists at its target position.
      */
-    public void buildBoxesInto(final JoltVoxelColliderData entry, final BlockState state) {
+    public synchronized void buildBoxesInto(final JoltVoxelColliderData entry, final BlockState state) {
         if (entry.isFluid) {
             return;
         }
