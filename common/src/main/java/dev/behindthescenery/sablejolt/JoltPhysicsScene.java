@@ -51,7 +51,18 @@ public final class JoltPhysicsScene {
      * (F = density * submergedVolume * |g|), so a body floats when its average
      * block mass is below this value and sinks when it is above.
      */
+    /**
+     * Density of fluids in per-block mass units. Buoyancy is gravity-proportional
+     * (F = density * submergedVolume * |g|), so a body floats when its average
+     * block mass is below this value and sinks when it is above.
+     */
     private static final double FLUID_DENSITY = 2.0;
+
+    /**
+     * Minimum interval between immediate shape rebuilds of a single body; changes
+     * within the window are coalesced into one batched rebuild next step.
+     */
+    private static final long REBUILD_THROTTLE_NANOS = 50_000_000L;
 
     private final PhysicsSystem system;
     private final BodyInterface bi;
@@ -287,6 +298,11 @@ public final class JoltPhysicsScene {
         double rebuiltComZ;
         int rebuiltOwnChunks = -1;
 
+        /**
+         * Nano time of the last shape rebuild; used to throttle immediate rebuilds.
+         */
+        long lastShapeRebuildNanos;
+
         public SableBody(final Kind kind, final int runtimeId) {
             this.kind = kind;
             this.runtimeId = runtimeId;
@@ -509,7 +525,16 @@ public final class JoltPhysicsScene {
             return;
         }
         sb.centerOfMass.set(x, y, z);
-        this.rebuildShape(sb);
+        // Throttled immediate rebuild: mass stats arrive after every placed block
+        // while a schematic is spawning, and a full rescan per block is O(N²).
+        // The first change rebuilds right away (collision stays fresh); changes
+        // within the throttle window are coalesced into one rebuild next step.
+        final long now = System.nanoTime();
+        if (now - sb.lastShapeRebuildNanos >= REBUILD_THROTTLE_NANOS) {
+            this.rebuildShape(sb);
+        } else {
+            this.markDirty(sb);
+        }
     }
 
     public void setLocalBounds(final int id, final int minX, final int minY, final int minZ, final int maxX, final int maxY, final int maxZ) {
@@ -524,7 +549,8 @@ public final class JoltPhysicsScene {
         sb.maxY = maxY;
         sb.maxZ = maxZ;
         sb.hasBounds = true;
-        this.rebuildShape(sb);
+        // batched: bounds updates accompany every mass-stat change while spawning
+        this.markDirty(sb);
     }
 
     /**
@@ -784,6 +810,7 @@ public final class JoltPhysicsScene {
         sb.rebuiltComY = sb.centerOfMass.y;
         sb.rebuiltComZ = sb.centerOfMass.z;
         sb.rebuiltOwnChunks = sb.chunks.size();
+        sb.lastShapeRebuildNanos = System.nanoTime();
 
         if (JoltDebugLogging.STAFF) {
             int sectionsInWindow = 0;
@@ -816,29 +843,34 @@ public final class JoltPhysicsScene {
 
         String rejectLog = null;
         final Vector3d translation = new Vector3d();
-        for (int bx = 0; bx < 16; bx++) {
-            for (int by = 0; by < 16; by++) {
-                for (int bz = 0; bz < 16; bz++) {
-                    final int packed = data.get(bx, by, bz);
-                    final int colliderId = ChunkSectionData.colliderIdOf(packed);
-                    final int voxelState = ChunkSectionData.voxelStateOf(packed);
-                    final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
-                    final boolean solid = isSolidBlock(packed, entry);
+        final int[] blocks = data.array();
 
-                    if (JoltDebugLogging.STAFF && colliderId > 0 && (!solid || !sb.contains(blockMinX + bx, blockMinY + by, blockMinZ + bz))) {
+        // NOTE: children must stay 1:1 with compound sub-shapes — Sable maps ray
+        // hits and contact callbacks back to blocks via the sub-shape index, so
+        // runs of blocks must not be merged into single stretched shapes.
+        for (int by = 0; by < 16; by++) {
+            final int worldY = blockMinY + by;
+            final int rowBase = (by << 8);
+            for (int bz = 0; bz < 16; bz++) {
+                final int worldZ = blockMinZ + bz;
+                final int cellBase = rowBase + (bz << 4);
+                for (int bx = 0; bx < 16; bx++) {
+                    final int packed = blocks[cellBase + bx];
+                    final int colliderId = ChunkSectionData.colliderIdOf(packed);
+                    final JoltVoxelColliderData entry = colliderId == 0 ? null : this.colliderRegistry.get(colliderId - 1);
+                    final boolean solid = isSolidBlock(packed, entry);
+                    final int worldX = blockMinX + bx;
+
+                    if (JoltDebugLogging.STAFF && colliderId > 0 && (!solid || (!ignoreBounds && !sb.contains(worldX, worldY, worldZ)))) {
                         final String reason = !solid
-                                ? "state=" + voxelState + (entry == null ? " entry=null" : " boxes=" + entry.boxes.size())
+                                ? "state=" + ChunkSectionData.voxelStateOf(packed) + (entry == null ? " entry=null" : " boxes=" + entry.boxes.size())
                                 : "outOfBounds";
-                        rejectLog = (rejectLog == null ? "" : rejectLog + "; ")
-                                + "block(" + (blockMinX + bx) + "," + (blockMinY + by) + "," + (blockMinZ + bz) + ") " + reason;
+                        rejectLog = appendReject(rejectLog, worldX, worldY, worldZ, reason);
                     }
 
                     if (!solid) {
                         continue;
                     }
-                    final int worldX = blockMinX + bx;
-                    final int worldY = blockMinY + by;
-                    final int worldZ = blockMinZ + bz;
                     if (!ignoreBounds && !sb.contains(worldX, worldY, worldZ)) {
                         continue;
                     }
@@ -850,6 +882,11 @@ public final class JoltPhysicsScene {
         if (JoltDebugLogging.STAFF && rejectLog != null) {
             Sable.LOGGER.info("[SableJolt] rebuild body {}: rejected: {}", sb.runtimeId, rejectLog);
         }
+    }
+
+    private static String appendReject(final String log, final int x, final int y, final int z, final String reason) {
+        final String entry = "block(" + x + "," + y + "," + z + ") " + reason;
+        return log == null ? entry : log + "; " + entry;
     }
 
     private void appendBlock(final SableBody sb, final MutableCompoundShape shape, final int bx, final int by, final int bz,
@@ -1446,10 +1483,10 @@ public final class JoltPhysicsScene {
             final JoltVoxelColliderData entry = this.colliderRegistry.get(c.colliderId - 1);
 
             if (complex) {
-                for (int i = 0; i < 8; i++) {
-                    final double ox = ((i & 1) * 2 - 1) * 0.25;
-                    final double oy = (((i >> 1) & 1) * 2 - 1) * 0.25;
-                    final double oz = (((i >> 2) & 1) * 2 - 1) * 0.25;
+                for (int j = 0; j < 8; j++) {
+                    final double ox = ((j & 1) * 2 - 1) * 0.25;
+                    final double oy = (((j >> 1) & 1) * 2 - 1) * 0.25;
+                    final double oz = (((j >> 2) & 1) * 2 - 1) * 0.25;
                     this.buoyancySample(body, sb, wbx, wby, wbz,
                             wx + ox, wy + oy, wz + oz, 0.25,
                             lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
