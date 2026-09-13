@@ -12,6 +12,7 @@ import dev.behindthescenery.sablejolt.collider.JoltVoxelColliderData;
 import dev.ryanhcode.sable.Sable;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import org.jetbrains.annotations.ApiStatus;
@@ -70,6 +71,20 @@ public final class JoltPhysicsScene {
                 return t;
             });
     private static final int MULTITHREAD_BODY_THRESHOLD = 24;
+
+    /**
+     * A body with at least this many compound children makes the native narrow
+     * phase dominate the step; such scenes use the multithreaded job system
+     * regardless of the body count.
+     */
+    private static final int HEAVY_BODY_CHILDREN = 2048;
+
+    /**
+     * Buoyancy iterates compound children per tick; above this count the loop is
+     * subsampled (with volume compensation) so a 30k-child body costs the same
+     * as a 4k-child one.
+     */
+    private static final int BUOYANCY_MAX_CHILDREN = 4096;
     private final ContactListener contactListener;
 
     public final JoltVoxelColliderData.Registry colliderRegistry = new JoltVoxelColliderData.Registry();
@@ -183,6 +198,10 @@ public final class JoltPhysicsScene {
         physics.setSpeculativeContactDistance(0.02f);
         physics.setNumVelocitySteps(10);
         physics.setNumPositionSteps(4);
+        // Big resting structures form huge contact islands; the splitter parallelizes
+        // and bounds their solve instead of one monolithic island iteration.
+        physics.setUseLargeIslandSplitter(true);
+        physics.setUseManifoldReduction(true);
         this.system.setPhysicsSettings(physics);
 
         this.bi = this.system.getBodyInterface();
@@ -265,6 +284,14 @@ public final class JoltPhysicsScene {
 
         public final Vector3d centerOfMass = new Vector3d();
 
+        /**
+         * Full sub-shape ID → leaf child. The body shape is a two-level compound
+         * (per-section static compounds under one parent), so the raw sub-shape ID
+         * from contacts is NOT the child index; this map, rebuilt with the shape,
+         * is the only mapping.
+         */
+        public final Int2ObjectOpenHashMap<Child> childById = new Int2ObjectOpenHashMap<>();
+
         public         int mountId = -1;
         public final Vector3d relPos = new Vector3d();
         public final Quaterniond relRot = new Quaterniond(1.0, 0.0, 0.0, 0.0);
@@ -287,6 +314,14 @@ public final class JoltPhysicsScene {
         double rebuiltComZ;
         int rebuiltOwnChunks = -1;
 
+        /**
+         * Nano time of the last completed shape rebuild. rebuildShape is throttled
+         * against this: a schematic spawn fires onStatsChanged per placed block,
+         * and without throttling the full compound rebuild runs once per block
+         * (quadratic in the structure size, tens of seconds of server freeze).
+         */
+        long lastShapeRebuildNanos;
+
         public SableBody(final Kind kind, final int runtimeId) {
             this.kind = kind;
             this.runtimeId = runtimeId;
@@ -300,11 +335,8 @@ public final class JoltPhysicsScene {
         }
 
         @Nullable
-        public Child childAt(final int shapeIndex) {
-            if (shapeIndex < 0 || shapeIndex >= this.children.size()) {
-                return null;
-            }
-            return this.children.get(shapeIndex);
+        public Child childAt(final int subShapeId) {
+            return this.childById.get(subShapeId);
         }
     }
 
@@ -324,6 +356,12 @@ public final class JoltPhysicsScene {
 
         com.github.stephengold.joltjni.readonly.ConstShape shape;
         final ArrayList<Child> children = new ArrayList<>();
+
+        /**
+         * Full sub-shape ID → leaf child (see SableBody.childById); the chunk shape
+         * is a static compound whose IDs are hierarchical, not plain indices.
+         */
+        final Int2ObjectOpenHashMap<Child> childById = new Int2ObjectOpenHashMap<>();
 
         GlobalChunk(final int cx, final int cy, final int cz, final ChunkSectionData data) {
             this.cx = cx;
@@ -509,7 +547,9 @@ public final class JoltPhysicsScene {
             return;
         }
         sb.centerOfMass.set(x, y, z);
-        this.rebuildShape(sb);
+        // Deferred: a schematic spawn fires this per placed block; a synchronous
+        // full compound rebuild per block is quadratic in the structure size.
+        this.markDirty(sb);
     }
 
     public void setLocalBounds(final int id, final int minX, final int minY, final int minZ, final int maxX, final int maxY, final int maxZ) {
@@ -524,7 +564,7 @@ public final class JoltPhysicsScene {
         sb.maxY = maxY;
         sb.maxZ = maxZ;
         sb.hasBounds = true;
-        this.rebuildShape(sb);
+        this.markDirty(sb);
     }
 
     /**
@@ -725,6 +765,13 @@ public final class JoltPhysicsScene {
         return entry.hasBoxes();
     }
 
+    /**
+     * Minimal interval between two full compound rebuilds of one body. Mass-stat
+     * storms (schematic spawns fire one {@code onStatsChanged} per placed block)
+     * coalesce into a couple of rebuilds per second instead of one per block.
+     */
+    private static final long SHAPE_REBUILD_THROTTLE_NANOS = 500_000_000L;
+
     private void rebuildShape(final SableBody sb) {
         // Dedup: mass-stat updates arrive every tick with the same inputs; a rebuild
         // is only needed when the com, bounds, chunk set or chunk data changed.
@@ -737,14 +784,28 @@ public final class JoltPhysicsScene {
             return;
         }
 
+        // Throttle: during a mass-stat storm every flush would rebuild the whole
+        // compound; cap the rate and re-mark for a later flush instead.
+        final long now = System.nanoTime();
+        if (sb.lastShapeRebuildNanos != 0 && now - sb.lastShapeRebuildNanos < SHAPE_REBUILD_THROTTLE_NANOS) {
+            this.markDirty(sb);
+            return;
+        }
+        sb.lastShapeRebuildNanos = now;
+
         final MutableCompoundShape shape = new MutableCompoundShape();
         sb.children.clear();
+        sb.childById.clear();
 
+        // Two-level compound: per-section static compounds (BVH-backed narrow
+        // phase) under one small parent. A flat mutable compound forces Jolt to
+        // brute-force every child per query, which made big bodies dominate the
+        // simulation step; sections keep the per-section cost logarithmic.
+        final LongArrayList sectionKeys = new LongArrayList();
         if (sb.kind == SableBody.Kind.CONTRAPTION) {
             // Contraptions own a dedicated chunk store (they have no plot java-side).
             for (final var entry : sb.chunks.long2ObjectEntrySet()) {
-                final long key = entry.getLongKey();
-                this.appendChunkBlocks(sb, shape, unpackChunkX(key), unpackChunkY(key), unpackChunkZ(key), entry.getValue(), true);
+                sectionKeys.add(entry.getLongKey());
             }
         } else if (sb.kind == SableBody.Kind.SUB_LEVEL && sb.hasBounds) {
             // Sub-levels build from the SHARED chunk store (plot sections are uploaded
@@ -765,8 +826,82 @@ public final class JoltPhysicsScene {
                 if (cx < chunkMinX || cx > chunkMaxX || cy < chunkMinY || cy > chunkMaxY || cz < chunkMinZ || cz > chunkMaxZ) {
                     continue;
                 }
-                this.appendChunkBlocks(sb, shape, cx, cy, cz, entry.getValue(), false);
+                sectionKeys.add(key);
             }
+        }
+        final long[] keys = sectionKeys.toLongArray();
+        java.util.Arrays.sort(keys);
+
+        int sectionOrdinal = 0;
+        int sectionsBuilt = 0;
+        try {
+            for (final long key : keys) {
+                final ChunkSectionData data = sb.kind == SableBody.Kind.CONTRAPTION
+                        ? sb.chunks.get(key) : this.allChunks.get(key);
+                if (data == null) {
+                    continue;
+                }
+                final StaticCompoundShapeSettings sectionSettings = new StaticCompoundShapeSettings();
+                final ArrayList<Child> sectionChildren = new ArrayList<>();
+                // Section COM (com-relative space): Jolt rebases section children onto
+                // the section center of mass when the static compound is created, so
+                // the section must be placed at exactly that offset inside the parent.
+                final Object[] sectionBuild = this.appendSectionBlocks(sb, sectionSettings, sectionChildren,
+                        unpackChunkX(key), unpackChunkY(key), unpackChunkZ(key), data,
+                        sb.kind == SableBody.Kind.CONTRAPTION);
+                if (sectionBuild == null) {
+                    // empty section (all air / no leaf boxes) — not an error
+                    continue;
+                }
+                final double[] sectionCom = (double[]) sectionBuild[0];
+                final Vec3 singleOffset = (Vec3) sectionBuild[1];
+                final com.github.stephengold.joltjni.readonly.ConstShape singleLeaf =
+                        (com.github.stephengold.joltjni.readonly.ConstShape) sectionBuild[2];
+                if (sectionChildren.isEmpty()) {
+                    continue;
+                }
+
+                final SubShapeIdCreator prefix;
+                if (singleLeaf != null) {
+                    // Jolt's CompoundShapeSettings.create() returns the single child
+                    // shape itself (dropping its offset) — add the leaf directly.
+                    shape.addShape(singleOffset, Quat.sIdentity(), singleLeaf);
+                    prefix = shape.getSubShapeIdFromIndex(sectionOrdinal++, new SubShapeIdCreator());
+                    final Child child = sectionChildren.get(0);
+                    sb.children.add(child);
+                    sb.childById.put(prefix.getId(), child);
+                    sectionsBuilt++;
+                    continue;
+                }
+
+                final CompoundShape sectionShape =
+                        (CompoundShape) ((com.github.stephengold.joltjni.ShapeRefC) sectionSettings.create().get()).getPtr();
+                shape.addShape(new Vec3((float) sectionCom[0], (float) sectionCom[1], (float) sectionCom[2]),
+                        Quat.sIdentity(), sectionShape);
+
+                // Full sub-shape ID → child: the parent contributes its child index,
+                // the section appends its internal path. Recorded at build time so the
+                // contact listener never has to decode the hierarchical ID.
+                prefix = shape.getSubShapeIdFromIndex(sectionOrdinal++, new SubShapeIdCreator());
+                for (int i = 0; i < sectionChildren.size(); i++) {
+                    final int id = sectionShape.getSubShapeIdFromIndex(i, prefix).getId();
+                    final Child child = sectionChildren.get(i);
+                    sb.children.add(child);
+                    sb.childById.put(id, child);
+                }
+                sectionsBuilt++;
+            }
+        } catch (final Throwable t) {
+            Sable.LOGGER.error("[SableJolt] rebuild body {}: section build FAILED (sectionsBuilt={} children={})",
+                    sb.runtimeId, sectionsBuilt, sb.children.size(), t);
+            sb.childById.clear();
+            sb.children.clear();
+            return;
+        }
+
+        if (JoltDebugLogging.HANDLE && sectionsBuilt > 1) {
+            Sable.LOGGER.info("[SableJolt:handle] rebuild body {}: sections={} children={} idMap={}",
+                    sb.runtimeId, sectionsBuilt, sb.children.size(), sb.childById.size());
         }
 
         sb.shape = shape;
@@ -808,19 +943,38 @@ public final class JoltPhysicsScene {
         }
     }
 
-    private void appendChunkBlocks(final SableBody sb, final MutableCompoundShape shape, final int cx, final int cy, final int cz,
-                                   final ChunkSectionData data, final boolean ignoreBounds) {
+    /**
+     * Builds one section's leaf boxes into {@code settings} and returns:
+     * [0] the section's volume-weighted center of mass in the body-COM-relative
+     * space (children were added at COM-relative offsets; the caller rebases the
+     * whole section onto this point), [1] the single leaf's rebased offset and
+     * [2] the single leaf shape — both non-null exactly when the section holds a
+     * single leaf (Jolt's {@code create()} returns that leaf directly, dropping
+     * its offset, so the caller must add it to the parent itself). Returns
+     * {@code null} when nothing was added.
+     */
+    @Nullable
+    private Object[] appendSectionBlocks(final SableBody sb, final StaticCompoundShapeSettings settings, final ArrayList<Child> outChildren,
+                                         final int cx, final int cy, final int cz,
+                                         final ChunkSectionData data, final boolean ignoreBounds) {
         final int blockMinX = cx << 4;
         final int blockMinY = cy << 4;
         final int blockMinZ = cz << 4;
 
-        String rejectLog = null;
+        // First pass: collect leaf boxes with their COM-relative offsets and volumes
+        // so the section COM is known before anything is added to the settings.
+        final ArrayList<Vec3> offsets = new ArrayList<>();
+        final ArrayList<com.github.stephengold.joltjni.readonly.ConstShape> shapes = new ArrayList<>();
         final Vector3d translation = new Vector3d();
+        final Vector3d half = new Vector3d();
+        double volSum = 0.0;
+        double comX = 0.0, comY = 0.0, comZ = 0.0;
+
+        String rejectLog = null;
         final int[] blocks = data.array();
 
-        // NOTE: children must stay 1:1 with compound sub-shapes — Sable maps ray
-        // hits and contact callbacks back to blocks via the sub-shape index, so
-        // runs of blocks must not be merged into single stretched shapes.
+        // NOTE: children stay 1:1 with compound leaf sub-shapes — the ID map built
+        // by the caller relies on the leaf order matching this traversal.
         for (int by = 0; by < 16; by++) {
             final int worldY = blockMinY + by;
             final int rowBase = (by << 8);
@@ -847,7 +1001,25 @@ public final class JoltPhysicsScene {
                     if (!ignoreBounds && !sb.contains(worldX, worldY, worldZ)) {
                         continue;
                     }
-                    this.appendBlock(sb, shape, worldX, worldY, worldZ, colliderId, translation);
+
+                    final List<float[]> secBoxes = this.colliderRegistry.get(colliderId - 1).boxes;
+                    for (int i = 0; i < secBoxes.size(); i++) {
+                        final float[] box = secBoxes.get(i);
+                        JoltVoxelColliderData.boxCenter(box, translation);
+                        JoltVoxelColliderData.boxHalfExtent(box, half);
+                        final double volume = (half.x() * 2.0) * (half.y() * 2.0) * (half.z() * 2.0);
+                        final Vec3 off = new Vec3(
+                                (float) (worldX + translation.x - sb.centerOfMass.x),
+                                (float) (worldY + translation.y - sb.centerOfMass.y),
+                                (float) (worldZ + translation.z - sb.centerOfMass.z));
+                        offsets.add(off);
+                        shapes.add(this.colliderRegistry.get(colliderId - 1).shape(i));
+                        outChildren.add(new Child(worldX, worldY, worldZ, colliderId));
+                        volSum += volume;
+                        comX += off.getX() * volume;
+                        comY += off.getY() * volume;
+                        comZ += off.getZ() * volume;
+                    }
                 }
             }
         }
@@ -855,28 +1027,35 @@ public final class JoltPhysicsScene {
         if (JoltDebugLogging.STAFF && rejectLog != null) {
             Sable.LOGGER.info("[SableJolt] rebuild body {}: rejected: {}", sb.runtimeId, rejectLog);
         }
+        if (offsets.isEmpty() || volSum <= 0.0) {
+            return null;
+        }
+
+        comX /= volSum;
+        comY /= volSum;
+        comZ /= volSum;
+
+        // Second pass: emit boxes rebased onto the section COM.
+        for (int i = 0; i < offsets.size(); i++) {
+            settings.addShape(new Vec3(
+                    (float) (offsets.get(i).getX() - comX),
+                    (float) (offsets.get(i).getY() - comY),
+                    (float) (offsets.get(i).getZ() - comZ)), Quat.sIdentity(), shapes.get(i));
+        }
+        final double[] com = new double[]{comX, comY, comZ};
+        if (offsets.size() == 1) {
+            return new Object[]{com,
+                    new Vec3((float) (offsets.get(0).getX() - comX),
+                            (float) (offsets.get(0).getY() - comY),
+                            (float) (offsets.get(0).getZ() - comZ)),
+                    shapes.get(0)};
+        }
+        return new Object[]{com, null, null};
     }
 
     private static String appendReject(final String log, final int x, final int y, final int z, final String reason) {
         final String entry = "block(" + x + "," + y + "," + z + ") " + reason;
         return log == null ? entry : log + "; " + entry;
-    }
-
-    private void appendBlock(final SableBody sb, final MutableCompoundShape shape, final int bx, final int by, final int bz,
-                             final int colliderId, final Vector3d translation) {
-        final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
-        final List<float[]> boxes = entry.boxes;
-        for (int i = 0; i < boxes.size(); i++) {
-            final float[] box = boxes.get(i);
-            JoltVoxelColliderData.boxCenter(box, translation);
-            shape.addShape(
-                    new Vec3((float) (bx + translation.x - sb.centerOfMass.x),
-                            (float) (by + translation.y - sb.centerOfMass.y),
-                            (float) (bz + translation.z - sb.centerOfMass.z)),
-                    Quat.sIdentity(),
-                    entry.shape(i));
-            sb.children.add(new Child(bx, by, bz, colliderId));
-        }
     }
 
     //endregion
@@ -910,7 +1089,7 @@ public final class JoltPhysicsScene {
             final SableBody sb = this.bodies.get(ownerId);
             if (sb != null) {
                 sb.chunks.put(key, section);
-                this.rebuildShape(sb);
+                this.markDirty(sb);
             }
             if (JoltDebugLogging.STAFF) {
                 Sable.LOGGER.info("[SableJolt] addChunk OWNED at ({},{},{}) owner={} bodyFound={} children={}",
@@ -1058,6 +1237,7 @@ public final class JoltPhysicsScene {
     private void buildGlobalChunkShape(final GlobalChunk chunk) {
         final com.github.stephengold.joltjni.StaticCompoundShapeSettings settings = new com.github.stephengold.joltjni.StaticCompoundShapeSettings();
         chunk.children.clear();
+        chunk.childById.clear();
 
         final int baseX = chunk.cx << 4;
         final int baseY = chunk.cy << 4;
@@ -1105,6 +1285,20 @@ public final class JoltPhysicsScene {
             return;
         }
         chunk.shape = settings.create().get();
+
+        // Full sub-shape ID → child (static compound IDs are hierarchical). A
+        // single-child chunk's shape IS the leaf itself; its whole-shape contact
+        // sub-shape ID is the empty ID (0).
+        if (chunk.children.size() == 1) {
+            chunk.childById.put(0, chunk.children.get(0));
+            return;
+        }
+        final CompoundShape compound =
+                (CompoundShape) ((com.github.stephengold.joltjni.ShapeRefC) chunk.shape).getPtr();
+        final SubShapeIdCreator parent = new SubShapeIdCreator();
+        for (int i = 0; i < chunk.children.size(); i++) {
+            chunk.childById.put(compound.getSubShapeIdFromIndex(i, parent).getId(), chunk.children.get(i));
+        }
     }
 
     /**
@@ -1264,7 +1458,7 @@ public final class JoltPhysicsScene {
         sb.relRot.set(rot);
         sb.linVel.set(linVel);
         sb.angVel.set(angVel);
-        this.rebuildShape(sb);
+        this.markDirty(sb);
     }
 
     public void addKinematicContraptionChunkSection(final int id, final int x, final int y, final int z, final int[] data) {
@@ -1275,7 +1469,7 @@ public final class JoltPhysicsScene {
         final ChunkSectionData section = new ChunkSectionData();
         System.arraycopy(data, 0, section.array(), 0, ChunkSectionData.BLOCKS);
         sb.chunks.put(ChunkSectionData.packSectionPos(x, y, z), section);
-        this.rebuildShape(sb);
+        this.markDirty(sb);
     }
 
     //endregion
@@ -1292,9 +1486,31 @@ public final class JoltPhysicsScene {
         this.computeBuoyancy();
         this.updateContraptionMotion((float) timeStep);
         // small scenes: a single-threaded job system avoids the wake/sync overhead
-        // of the thread pool, which dominates when the solver has almost no work
-        final JobSystem jobs = this.bodies.size() >= MULTITHREAD_BODY_THRESHOLD
+        // of the thread pool, which dominates when the solver has almost no work.
+        // A single body with a huge compound is NOT a small scene: its narrow phase
+        // dominates the step, so heavy bodies force the multithreaded job system.
+        boolean heavyBody = false;
+        for (final SableBody sb : this.bodies.values()) {
+            if (sb.children.size() >= HEAVY_BODY_CHILDREN) {
+                heavyBody = true;
+                break;
+            }
+        }
+        final JobSystem jobs = this.bodies.size() >= MULTITHREAD_BODY_THRESHOLD || heavyBody
                 ? this.jobSystem : this.singleThreadJobSystem;
+
+        // Adaptive solver depth: the default 10 velocity / 4 position iterations are
+        // tuned for small scenes. A huge compound body resting on the ground forms a
+        // contact island with thousands of points; halving the iteration depth there
+        // roughly halves the solver cost with no visible stability change.
+        if (heavyBody != this.reducedSolverApplied) {
+            final PhysicsSettings physics = this.system.getPhysicsSettings();
+            physics.setNumVelocitySteps(heavyBody ? 5 : 10);
+            physics.setNumPositionSteps(heavyBody ? 2 : 4);
+            this.system.setPhysicsSettings(physics);
+            this.reducedSolverApplied = heavyBody;
+        }
+
         this.system.update((float) timeStep, 1, this.tempAllocator, jobs);
         if (JoltDebugLogging.STAFF) {
             this.staffWorldDump();
@@ -1359,6 +1575,12 @@ public final class JoltPhysicsScene {
             Thread.currentThread().interrupt();
         }
     }
+
+    /**
+     * Whether the reduced solver iteration depth is currently applied (heavy-body
+     * scenes only; restored when the heavy body goes away).
+     */
+    private boolean reducedSolverApplied;
 
     private long lastWorldDump;
 
@@ -1470,8 +1692,15 @@ public final class JoltPhysicsScene {
         double centroidX = 0.0, centroidY = 0.0, centroidZ = 0.0;
 
         // Iterate the body's own collider blocks (already rebuilt and bounds-filtered
-        // in sb.children) instead of rescanning chunk section data.
-        for (final Child c : sb.children) {
+        // in sb.children) instead of rescanning chunk section data. Very large
+        // bodies are subsampled with volume compensation: fluid forces are a bulk
+        // effect, so a strided sample represents the whole body accurately while
+        // keeping the per-tick cost bounded.
+        final int childCount = sb.children.size();
+        final int stride = Math.max(1, childCount / BUOYANCY_MAX_CHILDREN);
+        for (int ci = 0; ci < childCount; ci += stride) {
+            final Child c = sb.children.get(ci);
+            final double sampleScale = stride;
             final double lpx = c.bx + 0.5 - sb.centerOfMass.x;
             final double lpy = c.by + 0.5 - sb.centerOfMass.y;
             final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
@@ -1504,7 +1733,7 @@ public final class JoltPhysicsScene {
             if (submerged <= 0.0) {
                 continue;
             }
-            final double volume = Math.min(1.0, submerged / (halfY * 2.0)) * mult;
+            final double volume = Math.min(1.0, submerged / (halfY * 2.0)) * mult * sampleScale;
             final double midY = Math.min(maxY, fluidTop) - submerged * 0.5;
 
             // drag: F = -v * 1.7 * volume at the submerged midpoint — damps both
@@ -2012,11 +2241,8 @@ public final class JoltPhysicsScene {
             }
         }
 
-        private static Child childOf(final GlobalChunk chunk, final int shapeIndex) {
-            if (shapeIndex < 0 || shapeIndex >= chunk.children.size()) {
-                return null;
-            }
-            return chunk.children.get(shapeIndex);
+        private static Child childOf(final GlobalChunk chunk, final int subShapeId) {
+            return chunk.childById.get(subShapeId);
         }
 
         private void invokeCallback(final JoltVoxelColliderData entry, final Child c, final Child other,
@@ -2106,16 +2332,29 @@ public final class JoltPhysicsScene {
             double px1 = 0, py1 = 0, pz1 = 0;
             double px2 = 0, py2 = 0, pz2 = 0;
             if (c1 != null) {
-                final SableBody sb = sb1;
-                px1 = c1.bx + 0.5 - sb.centerOfMass.x;
-                py1 = c1.by + 0.5 - sb.centerOfMass.y;
-                pz1 = c1.bz + 0.5 - sb.centerOfMass.z;
+                if (sb1 != null) {
+                    px1 = c1.bx + 0.5 - sb1.centerOfMass.x;
+                    py1 = c1.by + 0.5 - sb1.centerOfMass.y;
+                    pz1 = c1.bz + 0.5 - sb1.centerOfMass.z;
+                } else {
+                    // global chunk: block coords are world-absolute; express them
+                    // relative to the (static, unrotated) body position so the
+                    // com1 + rotate() reconstruction below stays exact
+                    px1 = c1.bx + 0.5 - com1x;
+                    py1 = c1.by + 0.5 - com1y;
+                    pz1 = c1.bz + 0.5 - com1z;
+                }
             }
             if (c2 != null) {
-                final SableBody sb = sb2;
-                px2 = c2.bx + 0.5 - sb.centerOfMass.x;
-                py2 = c2.by + 0.5 - sb.centerOfMass.y;
-                pz2 = c2.bz + 0.5 - sb.centerOfMass.z;
+                if (sb2 != null) {
+                    px2 = c2.bx + 0.5 - sb2.centerOfMass.x;
+                    py2 = c2.by + 0.5 - sb2.centerOfMass.y;
+                    pz2 = c2.bz + 0.5 - sb2.centerOfMass.z;
+                } else {
+                    px2 = c2.bx + 0.5 - com2x;
+                    py2 = c2.by + 0.5 - com2y;
+                    pz2 = c2.bz + 0.5 - com2z;
+                }
             }
 
             final Quat r1 = body1.getRotation();
