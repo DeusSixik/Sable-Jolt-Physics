@@ -2,8 +2,8 @@ package dev.behindthescenery.sablejolt;
 
 /**
  * A 16x16x16 voxel chunk section. Blocks are stored as packed ints in xzy order
- * (x fastest changing): {@code (colliderId << 16) | voxelStateId}, matching the
- * wire format used by the Sable pipeline.
+ * (x fastest changing): {@code (colliderId << 16) | (fluidLevel << 8) | voxelStateId},
+ * matching the wire format used by the Sable pipeline.
  */
 public final class ChunkSectionData {
     public static final int SIZE = 16;
@@ -32,7 +32,11 @@ public final class ChunkSectionData {
     }
 
     public int voxelState(final int x, final int y, final int z) {
-        return this.blocks[index(x, y, z)] & 0xFFFF;
+        return this.blocks[index(x, y, z)] & 0xFF;
+    }
+
+    public int fluidLevel(final int x, final int y, final int z) {
+        return fluidLevelOf(this.blocks[index(x, y, z)]);
     }
 
     public static int colliderIdOf(final int packed) {
@@ -40,7 +44,12 @@ public final class ChunkSectionData {
     }
 
     public static int voxelStateOf(final int packed) {
-        return packed & 0xFFFF;
+        return packed & 0xFF;
+    }
+
+    /** Fluid fill amount as uploaded from the pipeline (0 = no fluid, 1..8 = Minecraft fluid level). */
+    public static int fluidLevelOf(final int packed) {
+        return (packed >>> 8) & 0xF;
     }
 
     public static long packSectionPos(final int x, final int y, final int z) {

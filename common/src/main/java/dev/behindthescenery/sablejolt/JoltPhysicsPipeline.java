@@ -101,8 +101,8 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     /**
      * Packs a voxel collider ID and neighborhood state into an integer the pipeline will re-interpret as a block-state.
      */
-    private static int packBlockState(final VoxelNeighborhoodState state, final int colliderID) {
-        return ((int) state.byteRepresentation()) | (colliderID << 16);
+    private static int packBlockState(final VoxelNeighborhoodState state, final int colliderID, final int fluidLevel) {
+        return ((int) state.byteRepresentation() & 0xFF) | ((fluidLevel & 0xF) << 8) | (colliderID << 16);
     }
 
     private JoltPhysicsScene scene() {
@@ -255,7 +255,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
                                     final int index = bx + (bz << 4) + (by << 8);
                                     final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                                    array[index] = packBlockState(state, colliderValue);
+                                    array[index] = packBlockState(state, colliderValue, blockState.getFluidState().getAmount());
                                 }
                             }
                         }
@@ -331,7 +331,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
                     final int index = (x & 15) + ((z & 15) << 4) + ((y & 15) << 8);
 
                     final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                    chunk[index] = packBlockState(state, colliderValue);
+                    chunk[index] = packBlockState(state, colliderValue, blockState.getFluidState().getAmount());
                 }
             }
         }
@@ -415,12 +415,13 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
                     for (int by = 0; by < 16; by++) {
                         final BlockPos globalPos = new BlockPos(bx, by, bz).offset(sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ());
                         final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, chunk);
-                        final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(this.accelerator.getBlockState(globalPos));
+                        final BlockState blockState = this.accelerator.getBlockState(globalPos);
+                        final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
 
                         final int index = bx + (bz << 4) + (by << 8);
 
                         final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                        array[index] = packBlockState(state, colliderValue);
+                        array[index] = packBlockState(state, colliderValue, blockState.getFluidState().getAmount());
                     }
                 }
             }
@@ -482,11 +483,12 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
             final int nz = worldZ + dir.getStepZ();
             mpos.set(nx, ny, nz);
 
+            final BlockState neighborState = level.getBlockState(mpos);
             final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(accelerator, mpos, null);
-            final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(level.getBlockState(mpos));
+            final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(neighborState);
 
             final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-            scene.changeBlock(nx, ny, nz, packBlockState(state, colliderValue));
+            scene.changeBlock(nx, ny, nz, packBlockState(state, colliderValue, neighborState.getFluidState().getAmount()));
         }
 
         mpos.set(worldX, worldY, worldZ);
@@ -494,7 +496,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final JoltVoxelColliderData selfColliderData = bakery.getPhysicsDataForBlock(newState);
 
         final int selfColliderValue = selfColliderData == null ? 0 : this.colliderHandleOf(selfColliderData) + 1;
-        scene.changeBlock(worldX, worldY, worldZ, packBlockState(selfState, selfColliderValue));
+        scene.changeBlock(worldX, worldY, worldZ, packBlockState(selfState, selfColliderValue, newState.getFluidState().getAmount()));
     }
 
     /**
@@ -544,7 +546,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
                         final int index = bx + (bz << 4) + (by << 8);
                         final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                        array[index] = packBlockState(state, colliderValue);
+                        array[index] = packBlockState(state, colliderValue, blockState.getFluidState().getAmount());
                     }
                 }
             }

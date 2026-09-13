@@ -46,6 +46,13 @@ public final class JoltPhysicsScene {
      */
     private static final int ALLOWED_DOFS_ALL = 0x3F;
 
+    /**
+     * Density of fluids in per-block mass units. Buoyancy is gravity-proportional
+     * (F = density * submergedVolume * |g|), so a body floats when its average
+     * block mass is below this value and sinks when it is above.
+     */
+    private static final double FLUID_DENSITY = 2.0;
+
     private final PhysicsSystem system;
     private final BodyInterface bi;
 
@@ -697,6 +704,10 @@ public final class JoltPhysicsScene {
         if (voxelState < 1 || voxelState > 3 || colliderId <= 0 || entry == null) {
             return false;
         }
+        // fluids never produce collision; they only contribute buoyancy and drag
+        if (entry.isFluid) {
+            return false;
+        }
         // lazily (re)build the boxes: the first computation may have run before the
         // block existed at its target position, yielding a registered-but-empty entry
         if (!entry.hasBoxes()) {
@@ -1026,11 +1037,15 @@ public final class JoltPhysicsScene {
                 for (int bz = 0; bz < 16; bz++) {
                     final int packed = chunk.data.get(bx, by, bz);
                     final int colliderId = ChunkSectionData.colliderIdOf(packed);
-                    if (!isSolidBlock(packed, this.colliderRegistry.get(colliderId - 1))) {
+                    final JoltVoxelColliderData entry = colliderId == 0 ? null : this.colliderRegistry.get(colliderId - 1);
+                    if (entry == null) {
                         continue;
                     }
-                    final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
+                    // fluids are marked for buoyancy even though they never collide
                     anyFluid |= entry.isFluid;
+                    if (!isSolidBlock(packed, entry)) {
+                        continue;
+                    }
                     final List<float[]> boxes = entry.boxes;
                     for (int i = 0; i < boxes.size(); i++) {
                         final float[] box = boxes.get(i);
@@ -1094,21 +1109,29 @@ public final class JoltPhysicsScene {
     /**
      * Checks whether the given world block position holds a global fluid block.
      */
-    boolean isGlobalFluid(final int x, final int y, final int z) {
+    /**
+     * @return the fluid fill amount (0 = no fluid, 1..9) of the global fluid
+     * block at the given world block position; 9 means a full block.
+     */
+    int globalFluidLevelAt(final int x, final int y, final int z) {
         final long sectionKey = ChunkSectionData.packSectionPos(x >> 4, y >> 4, z >> 4);
         if (!this.fluidSections.contains(sectionKey)) {
-            return false;
+            return 0;
         }
         final GlobalChunk chunk = this.globalChunks.get(sectionKey);
         if (chunk == null) {
-            return false;
+            return 0;
         }
         final int colliderId = chunk.data.colliderId(x & 15, y & 15, z & 15);
         if (colliderId == 0) {
-            return false;
+            return 0;
         }
         final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
-        return entry != null && entry.isFluid;
+        if (entry == null || !entry.isFluid) {
+            return 0;
+        }
+        final int level = ChunkSectionData.fluidLevelOf(chunk.data.get(x & 15, y & 15, z & 15));
+        return level > 0 ? level : 9;
     }
 
     //endregion
@@ -1406,7 +1429,8 @@ public final class JoltPhysicsScene {
             final int wbx = floor(wx);
             final int wby = floor(wy);
             final int wbz = floor(wz);
-            if (!this.isGlobalFluid(wbx, wby, wbz)) {
+            final int fluidLevel = this.globalFluidLevelAt(wbx, wby, wbz);
+            if (fluidLevel <= 0) {
                 continue;
             }
 
@@ -1420,13 +1444,13 @@ public final class JoltPhysicsScene {
                     this.buoyancySample(body, sb, wbx, wby, wbz,
                             wx + ox, wy + oy, wz + oz, 0.25,
                             lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                            entry == null ? 1.0f : entry.volume);
+                            entry == null ? 1.0f : entry.volume, fluidLevel);
                 }
             } else {
                 this.buoyancySample(body, sb, wbx, wby, wbz,
                         wx, wy, wz, 0.5,
                         lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                        entry == null ? 1.0f : entry.volume);
+                        entry == null ? 1.0f : entry.volume, fluidLevel);
             }
         }
     }
@@ -1445,13 +1469,15 @@ public final class JoltPhysicsScene {
                                 final float lvx, final float lvy, final float lvz,
                                 final float avx, final float avy, final float avz,
                                 final double comX, final double comY, final double comZ,
-                                final float fluidVolume) {
-        // overlap volume between the cube around the sample point and the unit cube of the fluid block
+                                final float fluidVolume, final int fluidLevel) {
+        // overlap volume between the cube around the sample point and the fluid
+        // fill of the block (Minecraft fluids fill level/9 of the cell height)
+        final double fluidTop = wby + fluidLevel * (1.0 / 9.0);
         final double oxMin = Math.max(px - half, wbx);
         final double oyMin = Math.max(py - half, wby);
         final double ozMin = Math.max(pz - half, wbz);
         final double oxMax = Math.min(px + half, wbx + 1.0);
-        final double oyMax = Math.min(py + half, wby + 1.0);
+        final double oyMax = Math.min(py + half, fluidTop);
         final double ozMax = Math.min(pz + half, wbz + 1.0);
         final double volume = Math.max(0.0, oxMax - oxMin) * Math.max(0.0, oyMax - oyMin) * Math.max(0.0, ozMax - ozMin);
         if (volume <= 0.0) {
@@ -1470,8 +1496,9 @@ public final class JoltPhysicsScene {
         tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
         body.addForce(tmpForce, tmpPoint);
 
-        // float: F = (0, 10.5 * volume * fluidVolume, 0)
-        tmpForce.set(0.0f, (float) (10.5 * volume * fluidVolume), 0.0f);
+        // float: F = (0, ρ·V·|g|, 0) — gravity-proportional, so behavior follows the configured gravity
+        final float buoyancyK = (float) (-this.gravityY * FLUID_DENSITY);
+        tmpForce.set(0.0f, (float) (buoyancyK * volume * fluidVolume), 0.0f);
         body.addForce(tmpForce, tmpPoint);
     }
     //endregion
