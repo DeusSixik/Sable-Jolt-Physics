@@ -176,6 +176,15 @@ public final class JoltPhysicsScene {
         this.system.init(100_000, 0, 262_144, 65_536, layerMap, ovbFilter, ovoFilter);
         this.system.setGravity((float) gravityX, (float) gravityY, (float) gravityZ);
 
+        // Tighter contact margins than the Jolt defaults: dragged bodies must not
+        // sink into walls, and penetration is corrected aggressively along normals.
+        final PhysicsSettings physics = this.system.getPhysicsSettings();
+        physics.setPenetrationSlop(0.005f);
+        physics.setSpeculativeContactDistance(0.02f);
+        physics.setNumVelocitySteps(10);
+        physics.setNumPositionSteps(4);
+        this.system.setPhysicsSettings(physics);
+
         this.bi = this.system.getBodyInterface();
         this.tempAllocator = new TempAllocatorMalloc();
         this.jobSystem = new JobSystemThreadPool(Jolt.cMaxPhysicsJobs, Jolt.cMaxPhysicsBarriers, Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
@@ -1488,7 +1497,8 @@ public final class JoltPhysicsScene {
         tmpPoint.set(px, py, pz);
         final Vec3 tmpForce = this.tmpForce.get();
 
-        // drag: F = -v * 1.7 * volume
+        // drag: F = -v * 1.7 * volume, applied at the sample point so it also
+        // damps rotation and rights the body while it is submerged
         final double rx = px - comX, ry = py - comY, rz = pz - comZ;
         final double vx = lvx + avy * rz - avz * ry;
         final double vy = lvy + avz * rx - avx * rz;
@@ -1496,10 +1506,11 @@ public final class JoltPhysicsScene {
         tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
         body.addForce(tmpForce, tmpPoint);
 
-        // float: F = (0, ρ·V·|g|, 0) — gravity-proportional, so behavior follows the configured gravity
+        // float: applied at the center of mass — zero torque, keeps bodies stable
+        // on the surface instead of spinning from off-center sample forces
         final float buoyancyK = (float) (-this.gravityY * FLUID_DENSITY);
         tmpForce.set(0.0f, (float) (buoyancyK * volume * fluidVolume), 0.0f);
-        body.addForce(tmpForce, tmpPoint);
+        body.addForce(tmpForce);
     }
     //endregion
 
@@ -1875,8 +1886,9 @@ public final class JoltPhysicsScene {
 
     public void configSolverIterations(final int solverIterations, final int pgsIterations) {
         final var settings = this.system.getPhysicsSettings();
-        settings.setNumVelocitySteps(Math.max(1, solverIterations));
-        settings.setNumPositionSteps(Math.max(1, pgsIterations));
+        // clamped to the minimums that keep dragged bodies from sinking into walls
+        settings.setNumVelocitySteps(Math.max(10, solverIterations));
+        settings.setNumPositionSteps(Math.max(4, pgsIterations));
         this.system.setPhysicsSettings(settings);
     }
 
