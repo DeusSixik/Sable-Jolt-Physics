@@ -907,6 +907,14 @@ public final class JoltPhysicsScene {
         sb.shape = shape;
         this.bi.setShape(sb.joltId, shape, false, EActivation.DontActivate);
 
+        // CCD (LinearCast) sweeps the ENTIRE compound against the world every step;
+        // for huge bodies that costs seconds per tick while they fall. Huge bodies
+        // move slowly in practice, so switch them to discrete motion.
+        final boolean huge = sb.children.size() >= HEAVY_BODY_CHILDREN;
+        if (huge && this.bi.getMotionQuality(sb.joltId) != EMotionQuality.Discrete) {
+            this.bi.setMotionQuality(sb.joltId, EMotionQuality.Discrete);
+        }
+
         sb.rebuiltDataVersion = this.chunkDataVersion;
         sb.rebuiltHasBounds = sb.hasBounds;
         sb.rebuiltMinX = sb.minX;
@@ -1481,6 +1489,7 @@ public final class JoltPhysicsScene {
      * matching the cumulative effect of the rapier implementation.
      */
     public void step(final double timeStep) {
+        final long stepStartNanos = System.nanoTime();
         this.flushDirty();
         this.tickRopeAttachments();
         this.computeBuoyancy();
@@ -1515,7 +1524,23 @@ public final class JoltPhysicsScene {
         if (JoltDebugLogging.STAFF) {
             this.staffWorldDump();
         }
+        // Failsafe: a huge compound landing with deep penetration can collapse the
+        // solver into an ever-growing contact island. If the step overran its
+        // budget, put oversized bodies to sleep so the world can recover instead
+        // of freezing every subsequent tick.
+        final long updateNanos = System.nanoTime() - stepStartNanos;
+        if (updateNanos > 250_000_000L) {            for (final SableBody sb : this.bodies.values()) {
+                if (sb.children.size() >= HEAVY_BODY_CHILDREN && sb.body.isActive()) {
+                    this.bi.activateBody(sb.joltId); // refresh internal bounds bookkeeping
+                    if (sb.body.getLinearVelocity().lengthSq() < 0.5f) {
+                        this.bi.deactivateBody(sb.joltId);
+                    }
+                }
+            }
+        }
     }
+
+    private long stepStartNanos;
 
     /**
      * Splits per-body work into slices for the worker pool. The calling thread
