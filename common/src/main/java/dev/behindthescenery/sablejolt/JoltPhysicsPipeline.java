@@ -446,6 +446,16 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     /**
      * Handles the change of a block (from oldState to newState) in a chunk at chunk-relative position x, y, z.
      */
+    /**
+     * Re-entrancy guard for {@link #handleBlockChange}: our chunk loads can run
+     * queued generation tasks whose setBlock calls re-enter this hook, which
+     * previously recursed without bound (world-enter stall).
+     */
+    private static final ThreadLocal<Boolean> HANDLING_BLOCK_CHANGE = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    /**
+     * Handles the change of a block (from oldState to newState) in a chunk at chunk-relative position x, y, z.
+     */
     @Override
     public void handleBlockChange(final SectionPos sectionPos, final LevelChunkSection chunk,
                                   final int localX, final int localY, final int localZ,
@@ -459,44 +469,65 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final int worldY = (secY << 4) | (localY & 0xF);
         final int worldZ = (secZ << 4) | (localZ & 0xF);
 
-        // Self-heal: if Sable believes a world section is already uploaded but we lost
-        // it (e.g., it was removed while out of physics range and never re-added),
-        // re-read it from the live level so block edits keep colliding.
-        this.ensureWorldSection(secX, secY, secZ);
-        if (localX == 0)  this.ensureWorldSection(secX - 1, secY, secZ);
-        else if (localX == 15) this.ensureWorldSection(secX + 1, secY, secZ);
-        if (localY == 0)  this.ensureWorldSection(secX, secY - 1, secZ);
-        else if (localY == 15) this.ensureWorldSection(secX, secY + 1, secZ);
-        if (localZ == 0)  this.ensureWorldSection(secX, secY, secZ - 1);
-        else if (localZ == 15) this.ensureWorldSection(secX, secY, secZ + 1);
-
-        final var scene = this.scene();
-        final var bakery = this.bakery();
-        final var level = this.level;
-        final var accelerator = this.accelerator;
-
-        final BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos();
-
-        for (final Direction dir : DIRECTIONS) {
-            final int nx = worldX + dir.getStepX();
-            final int ny = worldY + dir.getStepY();
-            final int nz = worldZ + dir.getStepZ();
-            mpos.set(nx, ny, nz);
-
-            final BlockState neighborState = level.getBlockState(mpos);
-            final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(accelerator, mpos, null);
-            final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(neighborState);
+        // Re-entrancy guard: ensureWorldSection below synchronously loads chunks on
+        // this thread; a loaded chunk may run queued generation tasks whose setBlock
+        // fires this hook again. On re-entry forward only the single block update —
+        // no chunk loads, no sweeps; the affected sections are re-uploaded wholesale
+        // by Sable afterwards.
+        if (HANDLING_BLOCK_CHANGE.get()) {
+            final BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos(worldX, worldY, worldZ);
+            final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, mpos, null);
+            final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(newState);
 
             final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-            scene.changeBlock(nx, ny, nz, packBlockState(state, colliderValue, neighborState.getFluidState().getAmount()));
+            this.scene().changeBlock(worldX, worldY, worldZ,
+                    packBlockState(state, colliderValue, newState.getFluidState().getAmount()));
+            return;
         }
 
-        mpos.set(worldX, worldY, worldZ);
-        final VoxelNeighborhoodState selfState = VoxelNeighborhoodState.getState(accelerator, mpos, null);
-        final JoltVoxelColliderData selfColliderData = bakery.getPhysicsDataForBlock(newState);
+        HANDLING_BLOCK_CHANGE.set(Boolean.TRUE);
+        try {
+            // Self-heal: if Sable believes a world section is already uploaded but we lost
+            // it (e.g., it was removed while out of physics range and never re-added),
+            // re-read it from the live level so block edits keep colliding.
+            this.ensureWorldSection(secX, secY, secZ);
+            if (localX == 0)  this.ensureWorldSection(secX - 1, secY, secZ);
+            else if (localX == 15) this.ensureWorldSection(secX + 1, secY, secZ);
+            if (localY == 0)  this.ensureWorldSection(secX, secY - 1, secZ);
+            else if (localY == 15) this.ensureWorldSection(secX, secY + 1, secZ);
+            if (localZ == 0)  this.ensureWorldSection(secX, secY, secZ - 1);
+            else if (localZ == 15) this.ensureWorldSection(secX, secY, secZ + 1);
 
-        final int selfColliderValue = selfColliderData == null ? 0 : this.colliderHandleOf(selfColliderData) + 1;
-        scene.changeBlock(worldX, worldY, worldZ, packBlockState(selfState, selfColliderValue, newState.getFluidState().getAmount()));
+            final var scene = this.scene();
+            final var bakery = this.bakery();
+            final var level = this.level;
+            final var accelerator = this.accelerator;
+
+            final BlockPos.MutableBlockPos mpos = new BlockPos.MutableBlockPos();
+
+            for (final Direction dir : DIRECTIONS) {
+                final int nx = worldX + dir.getStepX();
+                final int ny = worldY + dir.getStepY();
+                final int nz = worldZ + dir.getStepZ();
+                mpos.set(nx, ny, nz);
+
+                final BlockState neighborState = level.getBlockState(mpos);
+                final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(accelerator, mpos, null);
+                final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(neighborState);
+
+                final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
+                scene.changeBlock(nx, ny, nz, packBlockState(state, colliderValue, neighborState.getFluidState().getAmount()));
+            }
+
+            mpos.set(worldX, worldY, worldZ);
+            final VoxelNeighborhoodState selfState = VoxelNeighborhoodState.getState(accelerator, mpos, null);
+            final JoltVoxelColliderData selfColliderData = bakery.getPhysicsDataForBlock(newState);
+
+            final int selfColliderValue = selfColliderData == null ? 0 : this.colliderHandleOf(selfColliderData) + 1;
+            scene.changeBlock(worldX, worldY, worldZ, packBlockState(selfState, selfColliderValue, newState.getFluidState().getAmount()));
+        } finally {
+            HANDLING_BLOCK_CHANGE.set(Boolean.FALSE);
+        }
     }
 
     /**
