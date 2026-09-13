@@ -898,6 +898,7 @@ public final class JoltPhysicsScene {
                 this.globalChunksByBodyId.remove(existing.joltId);
                 this.bi.removeBody(existing.joltId);
                 this.bi.destroyBody(existing.joltId);
+                existing.joltId = 0;
             }
             this.refreshGlobalChunkBody(chunk);
             if (JoltDebugLogging.STAFF) {
@@ -1014,7 +1015,10 @@ public final class JoltPhysicsScene {
                 this.globalChunksByBodyId.remove(chunk.joltId);
                 this.bi.removeBody(chunk.joltId);
                 this.bi.destroyBody(chunk.joltId);
+                chunk.joltId = 0;
             }
+            // a removed chunk must not be touched by a pending flush
+            this.dirtyGlobalChunks.remove(chunk);
         }
     }
 
@@ -1108,18 +1112,24 @@ public final class JoltPhysicsScene {
      * matches the chunk's current shape and data.
      */
     private void refreshGlobalChunkBody(final GlobalChunk chunk) {
+        // Staleness guard: a chunk that was replaced (addChunk) or removed
+        // (removeChunk) can linger in dirtyGlobalChunks. Its body is already
+        // destroyed — touching it again would double-free in native Jolt.
+        if (this.globalChunks.get(ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz)) != chunk) {
+            return;
+        }
+
         this.buildGlobalChunkShape(chunk);
 
         if (chunk.children.isEmpty()) {
-        if (chunk.joltId != 0) {
-            this.globalChunksByBodyId.remove(chunk.joltId);
-            this.bi.removeBody(chunk.joltId);
-            this.bi.destroyBody(chunk.joltId);
-            chunk.body = null;
-            chunk.joltId = 0;
+            if (chunk.joltId != 0) {
+                this.globalChunksByBodyId.remove(chunk.joltId);
+                this.bi.removeBody(chunk.joltId);
+                this.bi.destroyBody(chunk.joltId);
+                chunk.joltId = 0;
+            }
+            return;
         }
-        return;
-    }
 
         if (chunk.joltId == 0) {
             final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape, RVec3.sZero(), Quat.sIdentity(), EMotionType.Static, LAYER_STATIC);
@@ -1442,8 +1452,22 @@ public final class JoltPhysicsScene {
         final float lvx = lin.getX(), lvy = lin.getY(), lvz = lin.getZ();
         final float avx = ang.getX(), avy = ang.getY(), avz = ang.getZ();
 
-        final int sizeSum = (sb.maxX - sb.minX) + (sb.maxY - sb.minY) + (sb.maxZ - sb.minZ);
-        final boolean complex = sizeSum < 10;
+        final RVec3 tmpPoint = this.tmpPoint.get();
+        final Vec3 tmpForce = this.tmpForce.get();
+
+        // Rotated unit axes give the world-space Y extent of every child cube:
+        // an extent that stays correct (and smooth) for any body orientation.
+        final Vec3 ex = rotate(1.0f, 0.0f, 0.0f, rot);
+        final Vec3 ey = rotate(0.0f, 1.0f, 0.0f, rot);
+        final Vec3 ez = rotate(0.0f, 0.0f, 1.0f, rot);
+        final double halfY = 0.5 * (Math.abs(ex.getY()) + Math.abs(ey.getY()) + Math.abs(ez.getY()));
+
+        // Accumulated submerged volume and its centroid: the float force is applied
+        // at the centroid of the submerged part, so a tilted body gets a smooth
+        // righting torque (center of buoyancy shifts toward the deep end) and
+        // settles level, instead of keeping a frozen tilt or jittering.
+        double floatVolume = 0.0;
+        double centroidX = 0.0, centroidY = 0.0, centroidZ = 0.0;
 
         // Iterate the body's own collider blocks (already rebuilt and bounds-filtered
         // in sb.children) instead of rescanning chunk section data.
@@ -1466,74 +1490,60 @@ public final class JoltPhysicsScene {
             }
 
             final JoltVoxelColliderData entry = this.colliderRegistry.get(c.colliderId - 1);
+            final float mult = entry == null ? 1.0f : entry.volume;
 
-            if (complex) {
-                for (int j = 0; j < 8; j++) {
-                    final double ox = ((j & 1) * 2 - 1) * 0.25;
-                    final double oy = (((j >> 1) & 1) * 2 - 1) * 0.25;
-                    final double oz = (((j >> 2) & 1) * 2 - 1) * 0.25;
-                    this.buoyancySample(body, sb, wbx, wby, wbz,
-                            wx + ox, wy + oy, wz + oz, 0.25,
-                            lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                            entry == null ? 1.0f : entry.volume, fluidLevel);
-                }
-            } else {
-                this.buoyancySample(body, sb, wbx, wby, wbz,
-                        wx, wy, wz, 0.5,
-                        lvx, lvy, lvz, avx, avy, avz, comX, comY, comZ,
-                        entry == null ? 1.0f : entry.volume, fluidLevel);
+            // Vertical span of the rotated unit cube vs the fluid surface: the
+            // submerged height is smooth in rotation, so tilted small bodies get
+            // stable forces instead of axis-aligned overlap artifacts that spin
+            // them. For a centrally-symmetric cube the horizontal centroid of the
+            // submerged part is always its center — no spurious yaw torque.
+            final double fluidTop = wby + fluidLevel * (1.0 / 9.0);
+            final double minY = wy - halfY;
+            final double maxY = wy + halfY;
+            final double submerged = Math.min(maxY, fluidTop) - minY;
+            if (submerged <= 0.0) {
+                continue;
             }
+            final double volume = Math.min(1.0, submerged / (halfY * 2.0)) * mult;
+            final double midY = Math.min(maxY, fluidTop) - submerged * 0.5;
+
+            // drag: F = -v * 1.7 * volume at the submerged midpoint — damps both
+            // linear motion and rotation while submerged
+            final double rx = wx - comX, ry = midY - comY, rz = wz - comZ;
+            final double vx = lvx + avy * rz - avz * ry;
+            final double vy = lvy + avz * rx - avx * rz;
+            final double vz = lvz + avx * ry - avy * rx;
+            tmpPoint.set(wx, midY, wz);
+            tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
+            body.addForce(tmpForce, tmpPoint);
+
+            // accumulate submerged volume for the single centroid float force
+            floatVolume += volume;
+            centroidX += wx * volume;
+            centroidY += midY * volume;
+            centroidZ += wz * volume;
+        }
+
+        if (floatVolume > 0.0) {
+            // Float applied at the centroid of the submerged volume: zero torque
+            // when level, smooth righting torque when tilted — stable flotation.
+            tmpPoint.set((float) (centroidX / floatVolume),
+                    (float) (centroidY / floatVolume),
+                    (float) (centroidZ / floatVolume));
+            final float buoyancyK = (float) (-this.gravityY * FLUID_DENSITY);
+            tmpForce.set(0.0f, (float) (buoyancyK * floatVolume), 0.0f);
+            body.addForce(tmpForce, tmpPoint);
         }
     }
+
     private static int floor(final double v) {
         return (int) Math.floor(v);
     }
 
-    // Reusable wrappers for per-substep hot paths (server thread only).
-    // Reusable wrappers for the buoyancy hot path; ThreadLocal because the servo
+    // Reusable wrappers for the buoyancy hot path; ThreadLocal because the buoyancy
     // work is distributed across worker threads.
     private final ThreadLocal<Vec3> tmpForce = ThreadLocal.withInitial(Vec3::new);
     private final ThreadLocal<RVec3> tmpPoint = ThreadLocal.withInitial(RVec3::new);
-
-    private void buoyancySample(final Body body, final SableBody sb, final int wbx, final int wby, final int wbz,
-                                final double px, final double py, final double pz, final double half,
-                                final float lvx, final float lvy, final float lvz,
-                                final float avx, final float avy, final float avz,
-                                final double comX, final double comY, final double comZ,
-                                final float fluidVolume, final int fluidLevel) {
-        // overlap volume between the cube around the sample point and the fluid
-        // fill of the block (Minecraft fluids fill level/9 of the cell height)
-        final double fluidTop = wby + fluidLevel * (1.0 / 9.0);
-        final double oxMin = Math.max(px - half, wbx);
-        final double oyMin = Math.max(py - half, wby);
-        final double ozMin = Math.max(pz - half, wbz);
-        final double oxMax = Math.min(px + half, wbx + 1.0);
-        final double oyMax = Math.min(py + half, fluidTop);
-        final double ozMax = Math.min(pz + half, wbz + 1.0);
-        final double volume = Math.max(0.0, oxMax - oxMin) * Math.max(0.0, oyMax - oyMin) * Math.max(0.0, ozMax - ozMin);
-        if (volume <= 0.0) {
-            return;
-        }
-
-        final RVec3 tmpPoint = this.tmpPoint.get();
-        tmpPoint.set(px, py, pz);
-        final Vec3 tmpForce = this.tmpForce.get();
-
-        // drag: F = -v * 1.7 * volume, applied at the sample point so it also
-        // damps rotation and rights the body while it is submerged
-        final double rx = px - comX, ry = py - comY, rz = pz - comZ;
-        final double vx = lvx + avy * rz - avz * ry;
-        final double vy = lvy + avz * rx - avx * rz;
-        final double vz = lvz + avx * ry - avy * rx;
-        tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
-        body.addForce(tmpForce, tmpPoint);
-
-        // float: applied at the center of mass — zero torque, keeps bodies stable
-        // on the surface instead of spinning from off-center sample forces
-        final float buoyancyK = (float) (-this.gravityY * FLUID_DENSITY);
-        tmpForce.set(0.0f, (float) (buoyancyK * volume * fluidVolume), 0.0f);
-        body.addForce(tmpForce);
-    }
     //endregion
 
     //region Contraption motion
