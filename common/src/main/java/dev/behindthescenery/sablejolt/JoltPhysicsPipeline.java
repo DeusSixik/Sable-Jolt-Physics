@@ -463,11 +463,11 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         // re-read it from the live level so block edits keep colliding.
         this.ensureWorldSection(secX, secY, secZ);
         if (localX == 0)  this.ensureWorldSection(secX - 1, secY, secZ);
-        if (localX == 15) this.ensureWorldSection(secX + 1, secY, secZ);
+        else if (localX == 15) this.ensureWorldSection(secX + 1, secY, secZ);
         if (localY == 0)  this.ensureWorldSection(secX, secY - 1, secZ);
-        if (localY == 15) this.ensureWorldSection(secX, secY + 1, secZ);
+        else if (localY == 15) this.ensureWorldSection(secX, secY + 1, secZ);
         if (localZ == 0)  this.ensureWorldSection(secX, secY, secZ - 1);
-        if (localZ == 15) this.ensureWorldSection(secX, secY, secZ + 1);
+        else if (localZ == 15) this.ensureWorldSection(secX, secY, secZ + 1);
 
         final var scene = this.scene();
         final var bakery = this.bakery();
