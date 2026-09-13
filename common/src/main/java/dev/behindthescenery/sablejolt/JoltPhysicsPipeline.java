@@ -694,25 +694,52 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         try {
             configuration.validate(ServerSubLevelContainer.getContainer(this.level), bodyA, bodyB);
         } catch (final Exception e) {
+            if (JoltDebugLogging.HANDLE) {
+                Sable.LOGGER.error("[SableJolt:handle] addConstraint validation failed: A={} B={} cfg={}",
+                        bodyA, bodyB, configuration, e);
+            }
             throw new IllegalArgumentException("Constraint validation failed", e);
         }
 
+        // Sable's constraint contract: pos1 (world/bodyA side) is in the render
+        // frame next to the player, pos2 (bodyB side) is in the plot-global frame.
+        // The Jolt scene lives in the render frame, so pos1 is used as-is and pos2
+        // is projected into the render frame inside the handle (see
+        // JoltFreeConstraintHandle.create). isZeroAnchor marks the physics-staff
+        // sentinel (pos1 = ZERO + per-tick render-frame motor targets).
         final T constraint = switch (configuration) {
             case final RotaryConstraintConfiguration config ->
                     (T) JoltRotaryConstraintHandle.create(this.scene(), bodyA, bodyB, config);
             case final FixedConstraintConfiguration config ->
                     (T) JoltFixedConstraintHandle.create(this.scene(), bodyA, bodyB, config);
             case final FreeConstraintConfiguration config ->
-                    (T) JoltFreeConstraintHandle.create(this.scene(), bodyA, bodyB, config);
+                    (T) JoltFreeConstraintHandle.create(this.scene(), bodyA, bodyB, config, isZeroAnchor(config.pos1()));
             case final GenericConstraintConfiguration config ->
                     (T) JoltGenericConstraintHandle.create(this.scene(), bodyA, bodyB, config);
         };
 
         if (!constraint.isValid()) {
+            if (JoltDebugLogging.HANDLE) {
+                Sable.LOGGER.error("[SableJolt:handle] addConstraint produced an invalid handle: A={} B={} cfg={}",
+                        bodyA, bodyB, configuration);
+            }
             return null;
         }
 
+        if (JoltDebugLogging.HANDLE && configuration instanceof final FreeConstraintConfiguration config) {
+            Sable.LOGGER.info("[SableJolt:handle] addConstraint ok: A={} B={} pos1=({}) pos2=({})",
+                    bodyA, bodyB, config.pos1(), config.pos2());
+        }
+
         return constraint;
+    }
+
+    /**
+     * The physics staff passes the ZERO sentinel as pos1 and drives the motors
+     * with per-tick render-frame targets; that selects the render-frame servo.
+     */
+    private static boolean isZeroAnchor(final Vector3dc p) {
+        return p.x() == 0.0 && p.y() == 0.0 && p.z() == 0.0;
     }
 
     /**
