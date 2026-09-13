@@ -36,13 +36,11 @@ import dev.ryanhcode.sable.util.LevelAccelerator;
 import dev.ryanhcode.sable.util.SableMathUtils;
 import it.unimi.dsi.fastutil.ints.Int2ObjectArrayMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2LongMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
-import it.unimi.dsi.fastutil.objects.ReferenceList;
+import it.unimi.dsi.fastutil.objects.*;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
@@ -50,12 +48,13 @@ import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.BulkSectionAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
-import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix3dc;
@@ -63,6 +62,8 @@ import org.joml.Quaterniond;
 import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
+
+import java.util.Objects;
 
 /**
  * Implementation of {@link PhysicsPipeline} for the Jolt physics engine.
@@ -85,14 +86,14 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     private final Object2ObjectMap<KinematicContraption, TrackedKinematicContraption> activeContraptions = new Object2ObjectOpenHashMap<>();
     private final Long2LongOpenHashMap recentCollisions = new Long2LongOpenHashMap();
     private final ReferenceList<PhysicsPipelineBody> queuedWakeUps = new ReferenceArrayList<>();
-    private final double[] poseCache;
+    private final JoltPhysicsScene.PoseCache poseCache;
     private JoltPhysicsScene scene;
     private JoltVoxelColliderBakery colliderBakery;
 
     public JoltPhysicsPipeline(final ServerLevel level) {
         this.level = level;
         this.accelerator = new LevelAccelerator(level);
-        this.poseCache = new double[7];
+        this.poseCache = new JoltPhysicsScene.PoseCache();
     }
 
     /**
@@ -151,13 +152,14 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     @Override
     public void physicsTick(final double timeStep) {
         this.updateContraptionPoses();
-        this.scene().step(timeStep);
+        final JoltPhysicsScene scene = this.scene();
+        scene.step(timeStep);
 
         for (final PhysicsPipelineBody queuedWakeUp : this.queuedWakeUps) {
             if (queuedWakeUp.isRemoved()) {
                 continue;
             }
-            this.scene().wakeUpObject(queuedWakeUp.getRuntimeId());
+            scene.wakeUpObject(queuedWakeUp.getRuntimeId());
         }
         this.queuedWakeUps.clear();
     }
@@ -188,7 +190,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final Quaterniondc rot = pose.orientation();
 
         final int id = subLevel.getRuntimeId();
-        this.scene().createSubLevel(id, new double[]{pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()});
+        this.scene().createSubLevel(id, pos, rot);
 
         // Guarantee terrain collision at the assembly point even if Sable's chunk
         // tickets have not uploaded the world sections there yet.
@@ -220,38 +222,45 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final int minSectionY = this.level.getMinSection();
         final int maxSectionY = this.level.getMaxSection() - 1;
 
-        for (int x = centerSection.x() - 1; x <= centerSection.x() + 1; x++) {
-            for (int z = centerSection.z() - 1; z <= centerSection.z() + 1; z++) {
-                if (container.getPlot(x, z) != null) {
-                    continue;
-                }
-                for (int y = Math.max(centerSection.y() - 1, minSectionY); y <= Math.min(centerSection.y() + 1, maxSectionY); y++) {
-                    final SectionPos sectionPos = SectionPos.of(x, y, z);
-                    final int[] array = new int[LevelChunkSection.SECTION_SIZE];
+        // The Mojang mechanism for caching Sections in order to get BlockState as quickly as possible.
+        // It would be possible to get the elements directly from the PalettedContainer, but then there is a
+        // high chance of breaking the comp with some kind of mod.
+        try (BulkSectionAccess sectionAccess = new BulkSectionAccess(this.level)) {
+            final BlockPos.MutableBlockPos globalPos = new BlockPos.MutableBlockPos();
+            for (int x = centerSection.x() - 1; x <= centerSection.x() + 1; x++) {
+                for (int z = centerSection.z() - 1; z <= centerSection.z() + 1; z++) {
+                    if (container.getPlot(x, z) != null) {
+                        continue;
+                    }
+                    for (int y = Math.max(centerSection.y() - 1, minSectionY); y <= Math.min(centerSection.y() + 1, maxSectionY); y++) {
+                        final int[] array = new int[LevelChunkSection.SECTION_SIZE];
 
-                    boolean anySolid = false;
-                    for (int bx = 0; bx < 16; bx++) {
-                        for (int bz = 0; bz < 16; bz++) {
-                            for (int by = 0; by < 16; by++) {
-                                final BlockPos globalPos = new BlockPos(bx, by, bz).offset(sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ());
-                                final BlockState blockState = this.level.getBlockState(globalPos);
-                                if (blockState.isAir()) {
-                                    continue;
+                        boolean anySolid = false;
+                        for (int bx = 0; bx < 16; bx++) {
+                            globalPos.setX(bx + (x << 4));
+                            for (int bz = 0; bz < 16; bz++) {
+                                globalPos.setZ(bz + (z << 4));
+                                for (int by = 0; by < 16; by++) {
+                                    globalPos.setY(by + (y << 4));
+                                    final BlockState blockState = sectionAccess.getBlockState(globalPos);
+                                    if (blockState.isAir()) {
+                                        continue;
+                                    }
+                                    anySolid = true;
+
+                                    final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
+                                    final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
+
+                                    final int index = bx + (bz << 4) + (by << 8);
+                                    final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
+                                    array[index] = packBlockState(state, colliderValue);
                                 }
-                                anySolid = true;
-
-                                final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
-                                final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
-
-                                final int index = bx + (bz << 4) + (by << 8);
-                                final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                                array[index] = packBlockState(state, colliderValue);
                             }
                         }
-                    }
 
-                    if (anySolid) {
-                        this.scene().addChunk(x, y, z, array, true, -1);
+                        if (anySolid) {
+                            this.scene().addChunk(x, y, z, array, true, -1);
+                        }
                     }
                 }
             }
@@ -263,8 +272,9 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
      */
     @Override
     public void remove(final ServerSubLevel subLevel) {
-        this.scene().removeSubLevel(subLevel.getRuntimeId());
-        this.activeSubLevels.remove(subLevel.getRuntimeId());
+        final int id = subLevel.getRuntimeId();
+        this.scene().removeSubLevel(id);
+        this.activeSubLevels.remove(id);
     }
 
     /**
@@ -275,6 +285,9 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         if (this.activeContraptions.containsKey(contraption)) {
             throw new IllegalStateException("Contraption " + contraption + " is already present in pipeline");
         }
+
+        final JoltPhysicsScene scene = this.scene();
+        final JoltVoxelColliderBakery bakery = this.bakery();
 
         final int id = this.getNextRuntimeID();
         this.activeContraptions.put(contraption, new TrackedKinematicContraption(new Vector3d(), new Quaterniond(), new Vector3d(), new Vector3d(), id));
@@ -287,13 +300,15 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
         final Vector3dc pos = contraption.sable$getPosition();
         final Quaterniond rot = contraption.sable$getOrientation();
-        final double[] pose = {pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()};
 
-        this.scene().createKinematicContraption(mountId, id, pose);
+        scene.createKinematicContraption(mountId, id, pos, rot);
 
+        /*
         record UploadingContraptionChunk(int[] data) {
         }
-        final Long2ObjectMap<UploadingContraptionChunk> chunks = new Long2ObjectOpenHashMap<>();
+        */
+        // UploadingContraptionChunk
+        final Long2ObjectMap<int[]> chunks = new Long2ObjectOpenHashMap<>();
 
         final BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
         for (int x = localBounds.minX(); x <= localBounds.maxX(); x++) {
@@ -303,30 +318,31 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
                     if (blockState.isAir()) continue;
 
-                    final SectionPos sectionPos = SectionPos.of(blockPos);
-                    final UploadingContraptionChunk chunk = chunks.computeIfAbsent(sectionPos.asLong(), longPos -> new UploadingContraptionChunk(new int[LevelChunkSection.SECTION_SIZE]));
+                    final int[] chunk = chunks.computeIfAbsent(
+                            SectionPos.asLong(x >> 4, y >> 4, z >> 4),
+                            longPos -> new int[LevelChunkSection.SECTION_SIZE]
+                    );
 
                     final VoxelNeighborhoodState state = VoxelNeighborhoodState.CORNER;
-                    final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
+                    final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(blockState);
 
                     final int index = (x & 15) + ((z & 15) << 4) + ((y & 15) << 8);
 
                     final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                    chunk.data()[index] = packBlockState(state, colliderValue);
+                    chunk[index] = packBlockState(state, colliderValue);
                 }
             }
         }
 
         if (contraption.sable$shouldCollide()) {
-            for (final Long2ObjectMap.Entry<UploadingContraptionChunk> entry : chunks.long2ObjectEntrySet()) {
+            for (final Long2ObjectMap.Entry<int[]> entry : chunks.long2ObjectEntrySet()) {
                 final SectionPos sectionPos = SectionPos.of(entry.getLongKey());
-                final UploadingContraptionChunk chunk = entry.getValue();
-                this.scene().addKinematicContraptionChunkSection(id, sectionPos.x(), sectionPos.y(), sectionPos.z(), chunk.data());
+                scene.addKinematicContraptionChunkSection(id, sectionPos.x(), sectionPos.y(), sectionPos.z(), entry.getValue());
             }
         }
 
         this.updateContraptionPose(contraption, 1.0f);
-        this.scene().setLocalBounds(id, localBounds.minX(), localBounds.minY(), localBounds.minZ(), localBounds.maxX(), localBounds.maxY(), localBounds.maxZ());
+        scene.setLocalBounds(id, localBounds.minX(), localBounds.minY(), localBounds.minZ(), localBounds.maxX(), localBounds.maxY(), localBounds.maxZ());
     }
 
     private int colliderHandleOf(final JoltVoxelColliderData data) {
@@ -355,8 +371,9 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         this.assertBodyValid(subLevel);
         this.scene().getPose(subLevel.getRuntimeId(), this.poseCache);
 
-        dest.position().set(this.poseCache[0], this.poseCache[1], this.poseCache[2]);
-        dest.orientation().set(this.poseCache[3], this.poseCache[4], this.poseCache[5], this.poseCache[6]);
+
+        dest.position().set(this.poseCache.p1, this.poseCache.p2, this.poseCache.p3);
+        dest.orientation().set(this.poseCache.p4, this.poseCache.p5, this.poseCache.p6, this.poseCache.p7);
 
         return dest;
     }
@@ -428,39 +445,52 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
      */
     @Override
     public void handleBlockChange(final SectionPos sectionPos, final LevelChunkSection chunk, int x, int y, int z, final BlockState oldState, final BlockState newState) {
-        x = (sectionPos.x() << 4) + x;
-        y = (sectionPos.y() << 4) + y;
-        z = (sectionPos.z() << 4) + z;
+        final int lx = x, ly = y, lz = z;
+
+        final int sectionX = sectionPos.x();
+        final int sectionY = sectionPos.y();
+        final int sectionZ = sectionPos.z();
+
+        x = (sectionX << 4) + x;
+        y = (sectionY << 4) + y;
+        z = (sectionZ << 4) + z;
 
         // Self-heal: if Sable believes a world section is already uploaded but we lost
         // it (e.g., it was removed while out of physics range and never re-added),
         // re-read it from the live level so block edits keep colliding.
-        this.ensureWorldSection(x >> 4, y >> 4, z >> 4);
-        for (final Direction dir : Direction.values()) {
-            final BlockPos pos = globalBlockPosOrSelf(x, y, z, dir);
-            this.ensureWorldSection(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
-        }
+        this.ensureWorldSection(sectionX, sectionY, sectionZ);
 
-        final BlockPos globalBlockPos = new BlockPos(x, y, z);
+        if (lx == 0) this.ensureWorldSection(sectionX - 1, sectionY, sectionZ);
+        else if (lx == 15) this.ensureWorldSection(sectionX + 1, sectionY, sectionZ);
 
+        if (ly == 0) this.ensureWorldSection(sectionX, sectionY - 1, sectionZ);
+        else if (ly == 15) this.ensureWorldSection(sectionX, sectionY + 1, sectionZ);
+
+        if (lz == 0) this.ensureWorldSection(sectionX, sectionY, sectionZ - 1);
+        else if (lz == 15) this.ensureWorldSection(sectionX, sectionY, sectionZ + 1);
+
+        final BlockPos.MutableBlockPos globalBlockPos = new BlockPos.MutableBlockPos(x, y, z);
+
+        final JoltVoxelColliderBakery bakery = this.bakery();
+        final JoltPhysicsScene scene = this.scene();
         for (final Direction dir : Direction.values()) {
-            final BlockPos pos = globalBlockPos.relative(dir);
-            final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, pos, null);
-            final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(this.level.getBlockState(pos));
+            globalBlockPos.set(
+                    x + dir.getStepX(),
+                    y + dir.getStepY(),
+                    z + dir.getStepZ()
+            );
+            final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalBlockPos, null);
+            final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(this.level.getBlockState(globalBlockPos));
 
             final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-            this.scene().changeBlock(pos.getX(), pos.getY(), pos.getZ(), packBlockState(state, colliderValue));
+            scene.changeBlock(globalBlockPos.getX(), globalBlockPos.getY(), globalBlockPos.getZ(), packBlockState(state, colliderValue));
         }
 
         final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalBlockPos, null);
-        final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(newState);
+        final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(newState);
 
         final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-        this.scene().changeBlock(x, y, z, packBlockState(state, colliderValue));
-    }
-
-    private static BlockPos globalBlockPosOrSelf(final int x, final int y, final int z, final Direction dir) {
-        return new BlockPos(x, y, z).relative(dir);
+        scene.changeBlock(x, y, z, packBlockState(state, colliderValue));
     }
 
     /**
@@ -471,34 +501,47 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         if (this.scene().hasChunk(sx, sy, sz)) {
             return;
         }
-        final ServerSubLevelContainer container = ServerSubLevelContainer.getContainer(this.level);
+
+        final ServerLevel level = this.level;
+        final ServerSubLevelContainer container = ServerSubLevelContainer.getContainer(level);
         if (container != null && container.getPlot(sx, sz) != null) {
             return;
         }
 
         final SectionPos sectionPos = SectionPos.of(sx, sy, sz);
-        if (!this.level.hasChunkAt(sectionPos.center())) {
+        if (!level.hasChunkAt(sectionPos.center())) {
             return;
         }
 
         final int[] array = new int[LevelChunkSection.SECTION_SIZE];
         boolean anySolid = false;
-        for (int bx = 0; bx < 16; bx++) {
-            for (int bz = 0; bz < 16; bz++) {
-                for (int by = 0; by < 16; by++) {
-                    final BlockPos globalPos = new BlockPos(bx, by, bz).offset(sectionPos.minBlockX(), sectionPos.minBlockY(), sectionPos.minBlockZ());
-                    final BlockState blockState = this.level.getBlockState(globalPos);
-                    if (blockState.isAir()) {
-                        continue;
+
+        final BlockPos.MutableBlockPos globalPos = new BlockPos.MutableBlockPos();
+        final JoltVoxelColliderBakery bakery = this.bakery();
+
+        // The Mojang mechanism for caching Sections in order to get BlockState as quickly as possible.
+        // It would be possible to get the elements directly from the PalettedContainer, but then there is a
+        // high chance of breaking the comp with some kind of mod.
+        try (BulkSectionAccess sectionAccess = new BulkSectionAccess(level)) {
+            for (int bx = 0; bx < 16; bx++) {
+                globalPos.setX(bx + sectionPos.minBlockX());
+                for (int bz = 0; bz < 16; bz++) {
+                    globalPos.setZ(bz + sectionPos.minBlockZ());
+                    for (int by = 0; by < 16; by++) {
+                        globalPos.setY(by + sectionPos.minBlockY());
+                        final BlockState blockState = sectionAccess.getBlockState(globalPos);
+                        if (blockState.isAir()) {
+                            continue;
+                        }
+                        anySolid = true;
+
+                        final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
+                        final JoltVoxelColliderData colliderData = bakery.getPhysicsDataForBlock(blockState);
+
+                        final int index = bx + (bz << 4) + (by << 8);
+                        final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
+                        array[index] = packBlockState(state, colliderValue);
                     }
-                    anySolid = true;
-
-                    final VoxelNeighborhoodState state = VoxelNeighborhoodState.getState(this.accelerator, globalPos, null);
-                    final JoltVoxelColliderData colliderData = this.bakery().getPhysicsDataForBlock(blockState);
-
-                    final int index = bx + (bz << 4) + (by << 8);
-                    final int colliderValue = colliderData == null ? 0 : this.colliderHandleOf(colliderData) + 1;
-                    array[index] = packBlockState(state, colliderValue);
                 }
             }
         }
@@ -514,14 +557,15 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
         final BoundingBox3ic plotBounds = subLevel.getPlot().getBoundingBox();
         final int id = subLevel.getRuntimeId();
+        final JoltPhysicsScene scene = this.scene();
 
         final Vector3dc centerOfMass = subLevel.getMassTracker().getCenterOfMass();
         if (centerOfMass != null) {
-            this.scene().setCenterOfMass(id, centerOfMass.x(), centerOfMass.y(), centerOfMass.z());
+            scene.setCenterOfMass(id, centerOfMass.x(), centerOfMass.y(), centerOfMass.z());
             this.setMassPropertiesFrom(id, subLevel.getMassTracker());
         }
 
-        this.scene().setLocalBounds(id, plotBounds.minX(), plotBounds.minY(), plotBounds.minZ(), plotBounds.maxX(), plotBounds.maxY(), plotBounds.maxZ());
+        scene.setLocalBounds(id, plotBounds.minX(), plotBounds.minY(), plotBounds.minZ(), plotBounds.maxX(), plotBounds.maxY(), plotBounds.maxZ());
     }
 
     /**
@@ -571,14 +615,14 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     public Vector3d getLinearVelocity(final PhysicsPipelineBody body, final Vector3d dest) {
         this.assertBodyValid(body);
         this.scene().getLinearVelocity(body.getRuntimeId(), this.poseCache);
-        return dest.set(this.poseCache[0], this.poseCache[1], this.poseCache[2]);
+        return dest.set(this.poseCache.p1, this.poseCache.p2, this.poseCache.p3);
     }
 
     @Override
     public Vector3d getAngularVelocity(final PhysicsPipelineBody body, final Vector3d dest) {
         this.assertBodyValid(body);
         this.scene().getAngularVelocity(body.getRuntimeId(), this.poseCache);
-        return dest.set(this.poseCache[0], this.poseCache[1], this.poseCache[2]);
+        return dest.set(this.poseCache.p1, this.poseCache.p2, this.poseCache.p3);
     }
 
     /**
@@ -652,19 +696,9 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
     private void setMassPropertiesFrom(final int id, final MassData massTracker) {
         final Matrix3dc inertiaTensor = massTracker.getInertiaTensor();
-        final Vector3dc centerOfMass = massTracker.getCenterOfMass();
         final double mass = massTracker.getMass();
 
-        // This is only called in one location and the center of mass can't be null
-        //noinspection DataFlowIssue
-        final double[] centerOfMassArray = new double[]{centerOfMass.x(), centerOfMass.y(), centerOfMass.z()};
-        final double[] inertiaTensorArray = new double[]{
-                inertiaTensor.m00(), inertiaTensor.m01(), inertiaTensor.m02(),
-                inertiaTensor.m10(), inertiaTensor.m11(), inertiaTensor.m12(),
-                inertiaTensor.m20(), inertiaTensor.m21(), inertiaTensor.m22()
-        };
-
-        this.scene().setMassProperties(id, mass, centerOfMassArray, inertiaTensorArray);
+        this.scene().setMassProperties(id, mass, inertiaTensor);
     }
 
     private void assertBodyValid(final PhysicsPipelineBody body) {
@@ -672,6 +706,12 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
             throw new RuntimeException("Body has been removed");
         }
     }
+
+    // Reusable scratch for contraption pose uploads (server thread only).
+    private final Vector3d tmpContraptionPos = new Vector3d();
+    private final Vector3d tmpLinVel = new Vector3d();
+    private final Vector3d tmpAngVel = new Vector3d();
+    private final Quaterniond tmpQuat = new Quaterniond();
 
     private void updateContraptionPoses() {
         final SubLevelPhysicsSystem system = SubLevelPhysicsSystem.require(this.level);
@@ -688,14 +728,14 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         final SubLevel mountSubLevel = Sable.HELPER.getContaining(this.level, contraption.sable$getPosition());
         final Vector3dc parentCenterOfMass = mountSubLevel != null ? ((ServerSubLevel) mountSubLevel).getMassTracker().getCenterOfMass() : JOMLConversion.ZERO;
 
-        final Vector3dc lastPosition = new Vector3d(contraption.sable$getPosition(partialPhysicsTick - 1.0f));
-        final Quaterniondc lastOrientation = new Quaterniond(contraption.sable$getOrientation(partialPhysicsTick - 1.0f));
+        final Vector3dc lastPosition = contraption.sable$getPosition(partialPhysicsTick - 1.0f);
+        final Quaterniond lastOrientation = contraption.sable$getOrientation(partialPhysicsTick - 1.0f);
 
-        final Vector3d pos = new Vector3d(contraption.sable$getPosition(partialPhysicsTick));
+        final Vector3d pos = this.tmpContraptionPos.set(contraption.sable$getPosition(partialPhysicsTick));
         final Quaterniondc rot = contraption.sable$getOrientation(partialPhysicsTick);
 
-        final Vector3d linVel = pos.sub(lastPosition, new Vector3d());
-        final Vector3d angVel = SableMathUtils.getAngularVelocity(lastOrientation, rot, new Vector3d());
+        final Vector3d linVel = this.tmpLinVel.set(pos).sub(lastPosition);
+        final Vector3d angVel = SableMathUtils.getAngularVelocity(lastOrientation, rot, this.tmpAngVel);
 
         linVel.mul(20.0);
         angVel.mul(20.0);
@@ -704,19 +744,17 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
 
         pos.sub(parentCenterOfMass);
 
+        final double rotationDelta = this.tmpQuat.set(rot).div(trackedContraption.lastUploadedOrientation()).angle();
         if (
                 pos.distanceSquared(trackedContraption.lastUploadedPosition()) > DISTANCE_THRESHOLD * DISTANCE_THRESHOLD ||
                         linVel.distanceSquared(trackedContraption.lastUploadedLinVel()) > DISTANCE_THRESHOLD * DISTANCE_THRESHOLD ||
                         angVel.distanceSquared(trackedContraption.lastUploadedAngVel()) > DISTANCE_THRESHOLD * DISTANCE_THRESHOLD ||
-                        rot.div(trackedContraption.lastUploadedOrientation(), new Quaterniond()).angle() > ANGULAR_THRESHOLD * ANGULAR_THRESHOLD
+                        rotationDelta > ANGULAR_THRESHOLD * ANGULAR_THRESHOLD
         ) {
             final MassTracker massTracker = contraption.sable$getMassTracker();
             final Vector3dc centerOfMass = massTracker.getCenterOfMass();
 
-            final double[] centerOfMassArray = new double[]{centerOfMass.x(), centerOfMass.y(), centerOfMass.z()};
-            final double[] poseArray = {pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()};
-            final double[] velocityArray = {linVel.x(), linVel.y(), linVel.z(), angVel.x(), angVel.y(), angVel.z()};
-            this.scene().setKinematicContraptionTransform(trackedContraption.id(), centerOfMassArray, poseArray, velocityArray);
+            this.scene().setKinematicContraptionTransform(trackedContraption.id(), centerOfMass, pos, rot, linVel, angVel);
 
             trackedContraption.lastUploadedPosition().set(pos);
             trackedContraption.lastUploadedLinVel().set(linVel);
@@ -726,93 +764,106 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     }
 
     private void processCollisionEffects() {
-        this.recentCollisions.long2LongEntrySet().removeIf(entry -> this.level.getGameTime() - entry.getLongValue() > 2);
+        final ObjectIterator<Long2LongMap.Entry> recentCollectionsIterator =
+                this.recentCollisions.long2LongEntrySet().iterator();
 
-        final Vector3d localPointA = new Vector3d();
-        final Vector3d localPointB = new Vector3d();
-        final Vector3d localNormalA = new Vector3d();
-        final Vector3d localNormalB = new Vector3d();
+        // Hand unwrap virtual invoke
+        final long gameTime = this.level.getGameTime();
+        while (recentCollectionsIterator.hasNext()) {
+            final Long2LongMap.Entry entry = recentCollectionsIterator.next();
 
-        final Vector3d globalPointA = new Vector3d();
-        final Vector3d globalPointB = new Vector3d();
+            if (gameTime - entry.getLongValue() > 2) {
+                recentCollectionsIterator.remove();
+            }
+        }
 
         final double[] collisions = this.scene().clearCollisions();
 
         final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        final BlockPos.MutableBlockPos cornerPos = new BlockPos.MutableBlockPos();
+        final Vector3d globalPoint = new Vector3d();
 
         for (int i = 0; i < collisions.length / 15; i++) {
-            final int startIndex = i * 15;
-            final int idA = (int) collisions[startIndex];
-            final int idB = (int) collisions[startIndex + 1];
-
-            final double forceAmount = collisions[startIndex + 2];
-            localNormalA.set(collisions[startIndex + 3], collisions[startIndex + 4], collisions[startIndex + 5]);
-            localNormalB.set(collisions[startIndex + 6], collisions[startIndex + 7], collisions[startIndex + 8]);
-            localPointA.set(collisions[startIndex + 9], collisions[startIndex + 10], collisions[startIndex + 11]);
-            localPointB.set(collisions[startIndex + 12], collisions[startIndex + 13], collisions[startIndex + 14]);
+            final int base = i * 15;
+            // record layout: [idA, idB, force, normalA(3), normalB(3), pointA(3), pointB(3)];
+            // normals and point B are unused downstream (same as the rapier pipeline)
+            final int idA = (int) collisions[base];
+            final int idB = (int) collisions[base + 1];
+            final double forceAmount = collisions[base + 2];
+            final double pax = collisions[base + 9], pay = collisions[base + 10], paz = collisions[base + 11];
+            final double pbx = collisions[base + 12], pby = collisions[base + 13], pbz = collisions[base + 14];
 
             final ServerSubLevel subLevelA = this.activeSubLevels.get(idA);
             final ServerSubLevel subLevelB = this.activeSubLevels.get(idB);
 
             final double minMass = Math.min(subLevelA != null ? subLevelA.getMassTracker().getMass() : Double.MAX_VALUE, subLevelB != null ? subLevelB.getMassTracker().getMass() : Double.MAX_VALUE);
-
-            if (forceAmount > 25.0 * minMass) {
-                BlockState stateA = Blocks.STONE.defaultBlockState();
-                BlockState stateB = stateA;
-
-                if (subLevelA != null) {
-                    final Pose3d pose = subLevelA.logicalPose();
-                    pos.set(localPointA.x + pose.rotationPoint().x, localPointA.y + pose.rotationPoint().y, localPointA.z + pose.rotationPoint().z);
-                    cornerPos.set(localPointA.x + pose.rotationPoint().x + 0.5, localPointA.y + pose.rotationPoint().y + 0.5, localPointA.z + pose.rotationPoint().z + 0.5);
-
-                    final long exists = this.recentCollisions.put(cornerPos.asLong(), this.level.getGameTime());
-
-                    if (exists != -1) {
-                        continue;
-                    }
-
-                    stateA = this.accelerator.getBlockState(pos);
-                }
-
-                if (subLevelB != null) {
-                    final Pose3d pose = subLevelB.logicalPose();
-                    pos.set(localPointB.x + pose.rotationPoint().x, localPointB.y + pose.rotationPoint().y, localPointB.z + pose.rotationPoint().z);
-                    cornerPos.set(localPointB.x + pose.rotationPoint().x + 0.5, localPointB.y + pose.rotationPoint().y + 0.5, localPointB.z + pose.rotationPoint().z + 0.5);
-
-                    final long exists = this.recentCollisions.put(cornerPos.asLong(), this.level.getGameTime());
-
-                    if (exists != -1) {
-                        continue;
-                    }
-
-                    stateB = this.accelerator.getBlockState(pos);
-                }
-
-                globalPointA.set(localPointA);
-                globalPointB.set(localPointB);
-
-                if (subLevelA != null) {
-                    final Pose3d pose = subLevelA.logicalPose();
-                    pose.orientation().transform(globalPointA).add(pose.position());
-                }
-
-                if (subLevelB != null) {
-                    final Pose3d pose = subLevelB.logicalPose();
-                    pose.orientation().transform(globalPointB).add(pose.position());
-                }
-
-                final BlockState state = stateB;
-                this.level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state), globalPointA.x, globalPointA.y, globalPointA.z, 2, 0.0, 0.0, 0.0, 0.1);
-
-                final Vec3 position = JOMLConversion.toMojang(globalPointA);
-                final float volumeScale = 0.4f;
-                final SoundType soundType = state.getSoundType();
-
-                this.level.playSound(null, position.x, position.y, position.z, soundType.getStepSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (0.6 - 0.2 + Math.random() * 0.4));
-                this.level.playSound(null, position.x, position.y, position.z, soundType.getHitSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (Math.random() * 0.4));
-                this.level.playSound(null, position.x, position.y, position.z, soundType.getPlaceSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (0.5 - 0.2 + Math.random() * 0.4));
+            if (forceAmount <= 25.0 * minMass) {
+                continue;
             }
+
+            BlockState state = Blocks.STONE.defaultBlockState();
+
+            if (subLevelA != null) {
+                final Pose3d pose = subLevelA.logicalPose();
+
+                final double ppx = pax + pose.rotationPoint().x;
+                final double ppy = pay + pose.rotationPoint().y;
+                final double ppz = paz + pose.rotationPoint().z;
+
+                final int cornerPosX = Mth.floor(ppx + 0.5);
+                final int cornerPosY = Mth.floor(ppy + 0.5);
+                final int cornerPosZ = Mth.floor(ppz + 0.5);
+
+                final long cornerPosLong = BlockPos.asLong(cornerPosX, cornerPosY, cornerPosZ);
+
+                final long exists = this.recentCollisions.put(cornerPosLong, this.level.getGameTime());
+
+                if (exists != -1) {
+                    continue;
+                }
+            }
+
+            if (subLevelB != null) {
+                final Pose3d pose = subLevelB.logicalPose();
+
+                final double ppx = pbx + pose.rotationPoint().x;
+                final double ppy = pby + pose.rotationPoint().y;
+                final double ppz = pbz + pose.rotationPoint().z;
+
+                final int cornerPosX = Mth.floor(ppx + 0.5);
+                final int cornerPosY = Mth.floor(ppy + 0.5);
+                final int cornerPosZ = Mth.floor(ppz + 0.5);
+
+                final long cornerPosLong = BlockPos.asLong(cornerPosX, cornerPosY, cornerPosZ);
+
+                pos.set(ppx, ppy, ppz);
+
+                final long exists = this.recentCollisions.put(cornerPosLong, this.level.getGameTime());
+
+                if (exists != -1) {
+                    continue;
+                }
+
+                state = this.accelerator.getBlockState(pos);
+            }
+
+            globalPoint.set(pax, pay, paz);
+            if (subLevelA != null) {
+                final Pose3d pose = subLevelA.logicalPose();
+                pose.orientation().transform(globalPoint).add(pose.position());
+            }
+
+            final double px = globalPoint.x;
+            final double py = globalPoint.y;
+            final double pz = globalPoint.z;
+
+            this.level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state), px, py, pz, 2, 0.0, 0.0, 0.0, 0.1);
+
+            final float volumeScale = 0.4f;
+            final SoundType soundType = state.getSoundType();
+
+            this.level.playSound(null, px, py, pz, soundType.getStepSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (0.6 - 0.2 + Math.random() * 0.4));
+            this.level.playSound(null, px, py, pz, soundType.getHitSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (Math.random() * 0.4));
+            this.level.playSound(null, px, py, pz, soundType.getPlaceSound(), SoundSource.BLOCKS, 0.2f * volumeScale, (float) (0.5 - 0.2 + Math.random() * 0.4));
         }
     }
 

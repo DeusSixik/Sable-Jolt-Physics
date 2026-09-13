@@ -15,11 +15,10 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
-import org.joml.Quaterniond;
-import org.joml.Quaterniondc;
-import org.joml.Vector3d;
-import org.joml.Vector3dc;
+import org.joml.*;
 
+import java.lang.Math;
+import java.lang.Runtime;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
@@ -354,12 +353,12 @@ public final class JoltPhysicsScene {
 
     //region Body management
 
-    private SableBody createBody(final SableBody.Kind kind, final int runtimeId, final double[] pose, final int layer) {
+    private SableBody createBody(final SableBody.Kind kind, final int runtimeId, final Vector3dc pos, final Quaterniondc rot, final int layer) {
         final MutableCompoundShape shape = new MutableCompoundShape();
         final BodyCreationSettings bcs = new BodyCreationSettings(
                 shape,
-                new RVec3(pose[0], pose[1], pose[2]),
-                new Quat((float) pose[3], (float) pose[4], (float) pose[5], (float) pose[6]),
+                new RVec3(pos.x(), pos.y(), pos.z()),
+                new Quat((float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w()),
                 kind == SableBody.Kind.CONTRAPTION ? EMotionType.Kinematic : EMotionType.Dynamic,
                 layer);
         bcs.setLinearDamping((float) this.universalDrag);
@@ -397,8 +396,8 @@ public final class JoltPhysicsScene {
         this.bi.destroyBody(sb.joltId);
     }
 
-    public void createSubLevel(final int id, final double[] pose) {
-        this.createBody(SableBody.Kind.SUB_LEVEL, id, pose, LAYER_MOVING);
+    public void createSubLevel(final int id, final Vector3dc pos, final Quaterniondc rot) {
+        this.createBody(SableBody.Kind.SUB_LEVEL, id, pos, rot, LAYER_MOVING);
     }
 
     public void removeSubLevel(final int id) {
@@ -408,13 +407,13 @@ public final class JoltPhysicsScene {
         }
     }
 
-    public void createBox(final int id, final double mass, final double hx, final double hy, final double hz, final double[] pose) {
-        final SableBody sb = this.createBody(SableBody.Kind.BOX, id, pose, LAYER_MOVING);
+    public void createBox(final int id, final double mass, final double hx, final double hy, final double hz, final Vector3dc pos, final Quaterniondc rot) {
+        final SableBody sb = this.createBody(SableBody.Kind.BOX, id, pos, rot, LAYER_MOVING);
 
         final BodyCreationSettings bcs = new BodyCreationSettings(
                 new com.github.stephengold.joltjni.BoxShape(new Vec3((float) hx, (float) hy, (float) hz), 0.025f),
-                new RVec3(pose[0], pose[1], pose[2]),
-                new Quat((float) pose[3], (float) pose[4], (float) pose[5], (float) pose[6]),
+                new RVec3(pos.x(), pos.y(), pos.z()),
+                new Quat((float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w()),
                 EMotionType.Dynamic, LAYER_MOVING);
         bcs.setMotionQuality(EMotionQuality.LinearCast);
         bcs.setFriction(0.45f);
@@ -454,7 +453,20 @@ public final class JoltPhysicsScene {
 
     //region Pose / mass / teleport
 
-    public void getPose(final int id, final double[] store) {
+    /**
+     * Reusable destination for {@link #getPose} writes; avoids per-read allocations.
+     */
+    public static class PoseCache {
+        public double p1;
+        public double p2;
+        public double p3;
+        public double p4;
+        public double p5;
+        public double p6;
+        public double p7;
+    }
+
+    public void getPose(final int id, final PoseCache store) {
         final SableBody sb = this.bodies.get(id);
         if (sb == null) {
             return;
@@ -462,13 +474,13 @@ public final class JoltPhysicsScene {
         final Body body = sb.body;
         final RVec3 pos = body.getPosition();
         final Quat rot = body.getRotation();
-        store[0] = pos.xx();
-        store[1] = pos.yy();
-        store[2] = pos.zz();
-        store[3] = rot.getX();
-        store[4] = rot.getY();
-        store[5] = rot.getZ();
-        store[6] = rot.getW();
+        store.p1 = pos.xx();
+        store.p2 = pos.yy();
+        store.p3 = pos.zz();
+        store.p4 = rot.getX();
+        store.p5 = rot.getY();
+        store.p6 = rot.getZ();
+        store.p7 = rot.getW();
     }
 
     /**
@@ -499,9 +511,10 @@ public final class JoltPhysicsScene {
     }
 
     /**
-     * Overrides the mass, center of mass, and inertia tensor of a body.
+     * Overrides the mass and inertia tensor of a body. The center of mass is
+     * set separately via {@link #setCenterOfMass}.
      */
-    public void setMassProperties(final int id, final double mass, final double[] centerOfMass, final double[] inertiaTensor) {
+    public void setMassProperties(final int id, final double mass, final Matrix3dc inertiaTensor) {
         final SableBody sb = this.bodies.get(id);
         if (sb == null) {
             return;
@@ -513,21 +526,15 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final float[] m = new float[16];
-        m[0] = (float) inertiaTensor[0];
-        m[1] = (float) inertiaTensor[3];
-        m[2] = (float) inertiaTensor[6];
-        m[4] = (float) inertiaTensor[1];
-        m[5] = (float) inertiaTensor[4];
-        m[6] = (float) inertiaTensor[7];
-        m[8] = (float) inertiaTensor[2];
-        m[9] = (float) inertiaTensor[5];
-        m[10] = (float) inertiaTensor[8];
-        m[15] = 1.0f;
-
         final MassProperties mp = new MassProperties();
         mp.setMass((float) mass);
-        mp.setInertia(new Mat44(m));
+        // Mat44's varargs constructor expects 16 floats in column-major order
+        mp.setInertia(new Mat44(
+                (float) inertiaTensor.m00(), (float) inertiaTensor.m10(), (float) inertiaTensor.m20(), 0.0f,
+                (float) inertiaTensor.m01(), (float) inertiaTensor.m11(), (float) inertiaTensor.m21(), 0.0f,
+                (float) inertiaTensor.m02(), (float) inertiaTensor.m12(), (float) inertiaTensor.m22(), 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f
+        ));
         motion.setMassProperties(ALLOWED_DOFS_ALL, mp);
     }
 
@@ -567,26 +574,26 @@ public final class JoltPhysicsScene {
         }
     }
 
-    public void getLinearVelocity(final int id, final double[] store) {
+    public void getLinearVelocity(final int id, final PoseCache store) {
         final SableBody sb = this.bodies.get(id);
         if (sb == null) {
             return;
         }
         final Vec3 v = sb.body.getLinearVelocity();
-        store[0] = v.getX();
-        store[1] = v.getY();
-        store[2] = v.getZ();
+        store.p1 = v.getX();
+        store.p2 = v.getY();
+        store.p3 = v.getZ();
     }
 
-    public void getAngularVelocity(final int id, final double[] store) {
+    public void getAngularVelocity(final int id, final PoseCache store) {
         final SableBody sb = this.bodies.get(id);
         if (sb == null) {
             return;
         }
         final Vec3 v = sb.body.getAngularVelocity();
-        store[0] = v.getX();
-        store[1] = v.getY();
-        store[2] = v.getZ();
+        store.p1 = v.getX();
+        store.p2 = v.getY();
+        store.p3 = v.getZ();
     }
 
     /**
@@ -1107,11 +1114,11 @@ public final class JoltPhysicsScene {
 
     //region Kinematic contraptions
 
-    public void createKinematicContraption(final int mountId, final int id, final double[] pose) {
-        final SableBody sb = this.createBody(SableBody.Kind.CONTRAPTION, id, pose, LAYER_MOVING);
+    public void createKinematicContraption(final int mountId, final int id, final Vector3dc pos, final Quaterniondc rot) {
+        final SableBody sb = this.createBody(SableBody.Kind.CONTRAPTION, id, pos, rot, LAYER_MOVING);
         sb.mountId = mountId;
-        sb.relPos.set(pose[0], pose[1], pose[2]);
-        sb.relRot.set(pose[3], pose[4], pose[5], pose[6]);
+        sb.relPos.set(pos);
+        sb.relRot.set(rot);
 
         if (mountId != -1) {
             final SableBody mount = this.bodies.get(mountId);
@@ -1179,16 +1186,22 @@ public final class JoltPhysicsScene {
         }
     }
 
-    public void setKinematicContraptionTransform(final int id, final double[] centerOfMass, final double[] pose, final double[] velocities) {
+    /**
+     * Uploads a kinematic contraption's pose directly from the caller's JOML
+     * vectors. All arguments are read-only and copied into the body state
+     * immediately; no allocations are performed.
+     */
+    public void setKinematicContraptionTransform(final int id, final Vector3dc centerOfMass, final Vector3dc pos,
+                                                 final Quaterniondc rot, final Vector3dc linVel, final Vector3dc angVel) {
         final SableBody sb = this.bodies.get(id);
         if (sb == null) {
             return;
         }
-        sb.centerOfMass.set(centerOfMass[0], centerOfMass[1], centerOfMass[2]);
-        sb.relPos.set(pose[0], pose[1], pose[2]);
-        sb.relRot.set(pose[3], pose[4], pose[5], pose[6]);
-        sb.linVel.set(velocities[0], velocities[1], velocities[2]);
-        sb.angVel.set(velocities[3], velocities[4], velocities[5]);
+        sb.centerOfMass.set(centerOfMass);
+        sb.relPos.set(pos);
+        sb.relRot.set(rot);
+        sb.linVel.set(linVel);
+        sb.angVel.set(angVel);
         this.rebuildShape(sb);
     }
 
