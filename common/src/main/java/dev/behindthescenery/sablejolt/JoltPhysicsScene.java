@@ -13,6 +13,7 @@ import dev.ryanhcode.sable.Sable;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
 import org.joml.*;
@@ -234,7 +235,7 @@ public final class JoltPhysicsScene {
         public Body body;
 
         public MutableCompoundShape shape;
-        public final ArrayList<Child> children = new ArrayList<>();
+        public final ObjectArrayList<Child> children = new ObjectArrayList<>();
 
         public final Long2ObjectOpenHashMap<ChunkSectionData> chunks = new Long2ObjectOpenHashMap<>();
 
@@ -926,7 +927,7 @@ public final class JoltPhysicsScene {
 
     private void flushDirty() {
         if (!this.dirtyBodies.isEmpty()) {
-            final var list = new ArrayList<>(this.dirtyBodies);
+            final ObjectArrayList<SableBody> list = new ObjectArrayList<>(this.dirtyBodies);
             if (list.size() >= 8) {
                 this.runParallel(list, sb -> {
                     try {
@@ -1252,18 +1253,32 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(workers - 1);
+        // Slices are collected first so the latch matches the number of tasks
+        // actually submitted; otherwise an empty trailing slice would leave the
+        // caller waiting on counts that never happen (permanent server stall).
         final int sliceSize = (bodies.size() + workers - 1) / workers;
+        final java.util.List<int[]> slices = new java.util.ArrayList<>(workers - 1);
         for (int w = 1; w < workers; w++) {
             final int from = w * sliceSize;
             final int to = Math.min(bodies.size(), from + sliceSize);
             if (from >= to) {
                 break;
             }
-            final List<SableBody> slice = bodies.subList(from, to);
+            slices.add(new int[]{from, to});
+        }
+        if (slices.isEmpty()) {
+            for (final SableBody sb : bodies) {
+                action.accept(sb);
+            }
+            return;
+        }
+
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(slices.size());
+        for (final int[] slice : slices) {
+            final List<SableBody> part = bodies.subList(slice[0], slice[1]);
             this.bodyWorkers.submit(() -> {
                 try {
-                    for (final SableBody sb : slice) {
+                    for (final SableBody sb : part) {
                         action.accept(sb);
                     }
                 } catch (final Throwable t) {
