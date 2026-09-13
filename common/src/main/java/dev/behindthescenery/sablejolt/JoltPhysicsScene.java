@@ -51,18 +51,7 @@ public final class JoltPhysicsScene {
      * (F = density * submergedVolume * |g|), so a body floats when its average
      * block mass is below this value and sinks when it is above.
      */
-    /**
-     * Density of fluids in per-block mass units. Buoyancy is gravity-proportional
-     * (F = density * submergedVolume * |g|), so a body floats when its average
-     * block mass is below this value and sinks when it is above.
-     */
     private static final double FLUID_DENSITY = 2.0;
-
-    /**
-     * Minimum interval between immediate shape rebuilds of a single body; changes
-     * within the window are coalesced into one batched rebuild next step.
-     */
-    private static final long REBUILD_THROTTLE_NANOS = 50_000_000L;
 
     private final PhysicsSystem system;
     private final BodyInterface bi;
@@ -298,11 +287,6 @@ public final class JoltPhysicsScene {
         double rebuiltComZ;
         int rebuiltOwnChunks = -1;
 
-        /**
-         * Nano time of the last shape rebuild; used to throttle immediate rebuilds.
-         */
-        long lastShapeRebuildNanos;
-
         public SableBody(final Kind kind, final int runtimeId) {
             this.kind = kind;
             this.runtimeId = runtimeId;
@@ -525,16 +509,7 @@ public final class JoltPhysicsScene {
             return;
         }
         sb.centerOfMass.set(x, y, z);
-        // Throttled immediate rebuild: mass stats arrive after every placed block
-        // while a schematic is spawning, and a full rescan per block is O(N²).
-        // The first change rebuilds right away (collision stays fresh); changes
-        // within the throttle window are coalesced into one rebuild next step.
-        final long now = System.nanoTime();
-        if (now - sb.lastShapeRebuildNanos >= REBUILD_THROTTLE_NANOS) {
-            this.rebuildShape(sb);
-        } else {
-            this.markDirty(sb);
-        }
+        this.rebuildShape(sb);
     }
 
     public void setLocalBounds(final int id, final int minX, final int minY, final int minZ, final int maxX, final int maxY, final int maxZ) {
@@ -549,8 +524,7 @@ public final class JoltPhysicsScene {
         sb.maxY = maxY;
         sb.maxZ = maxZ;
         sb.hasBounds = true;
-        // batched: bounds updates accompany every mass-stat change while spawning
-        this.markDirty(sb);
+        this.rebuildShape(sb);
     }
 
     /**
@@ -810,7 +784,6 @@ public final class JoltPhysicsScene {
         sb.rebuiltComY = sb.centerOfMass.y;
         sb.rebuiltComZ = sb.centerOfMass.z;
         sb.rebuiltOwnChunks = sb.chunks.size();
-        sb.lastShapeRebuildNanos = System.nanoTime();
 
         if (JoltDebugLogging.STAFF) {
             int sectionsInWindow = 0;
@@ -979,12 +952,22 @@ public final class JoltPhysicsScene {
      * simulation step so bursts of block edits cost a single rebuild.
      */
     private void markDirty(final SableBody sb) {
-        this.dirtyBodies.add(sb);
+        // synchronized: rebuildShape runs on worker threads and may re-mark a body
+        // when a rebuild is throttled, while the server thread flushes the queue.
+        synchronized (this.dirtyBodies) {
+            this.dirtyBodies.add(sb);
+        }
     }
 
     private void flushDirty() {
         if (!this.dirtyBodies.isEmpty()) {
-            final ObjectArrayList<SableBody> list = new ObjectArrayList<>(this.dirtyBodies);
+            final ObjectArrayList<SableBody> list;
+            synchronized (this.dirtyBodies) {
+                list = new ObjectArrayList<>(this.dirtyBodies);
+                // removed before processing: a throttled rebuildShape re-marks its
+                // body for the next flush, and that must survive this flush
+                this.dirtyBodies.removeAll(list);
+            }
             if (list.size() >= 8) {
                 this.runParallel(list, sb -> {
                     try {
@@ -1002,7 +985,6 @@ public final class JoltPhysicsScene {
                     }
                 }
             }
-            this.dirtyBodies.clear();
         }
         if (!this.dirtyGlobalChunks.isEmpty()) {
             for (final GlobalChunk chunk : this.dirtyGlobalChunks) {
@@ -1386,6 +1368,9 @@ public final class JoltPhysicsScene {
             sb.append(" | #").append(body.runtimeId).append("/").append(body.kind)
                     .append(" pos=(").append((float) p.xx()).append(",").append((float) p.yy()).append(",").append((float) p.zz()).append(")")
                     .append(" children=").append(body.children.size())
+                    .append(" bounds=(").append(body.minX).append(",").append(body.minY).append(",").append(body.minZ)
+                    .append(")..(").append(body.maxX).append(",").append(body.maxY).append(",").append(body.maxZ).append(")")
+                    .append(" com=(").append((float) body.centerOfMass.x).append(",").append((float) body.centerOfMass.y).append(",").append((float) body.centerOfMass.z).append(")")
                     .append(" bounds=").append(body.hasBounds)
                     .append(" active=").append(body.body.isActive());
         }
