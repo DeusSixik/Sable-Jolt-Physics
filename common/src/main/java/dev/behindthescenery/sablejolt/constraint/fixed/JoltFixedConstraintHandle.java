@@ -25,13 +25,6 @@ public class JoltFixedConstraintHandle extends JoltConstraintHandle implements F
         final int joltA = sbA != null ? sbA.joltId : scene.groundBodyId();
         final int joltB = sbB != null ? sbB.joltId : scene.groundBodyId();
 
-        final double comAx = sbA != null ? sbA.centerOfMass.x : 0.0;
-        final double comAy = sbA != null ? sbA.centerOfMass.y : 0.0;
-        final double comAz = sbA != null ? sbA.centerOfMass.z : 0.0;
-        final double comBx = sbB != null ? sbB.centerOfMass.x : 0.0;
-        final double comBy = sbB != null ? sbB.centerOfMass.y : 0.0;
-        final double comBz = sbB != null ? sbB.centerOfMass.z : 0.0;
-
         final FixedConstraintSettings settings = new FixedConstraintSettings();
         settings.setSpace(EConstraintSpace.LocalToBodyCom);
         settings.setPoint1(scene.toLocalAnchor(sbA, config.pos1().x(), config.pos1().y(), config.pos1().z()));
