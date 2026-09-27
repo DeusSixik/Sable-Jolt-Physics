@@ -64,6 +64,32 @@ public final class JoltPhysicsScene {
     private final BodyInterface bi;
 
     /**
+     * Shared BoxShapes keyed by half extents. Terrain slabs repeat the same few
+     * sizes across thousands of sections and rope points repeat one size per
+     * rope; Jolt shapes are immutable and reference-counted, so one native
+     * instance per size replaces one instance per slab (native memory saver).
+     */
+    private final java.util.HashMap<BoxKey, BoxShape> sharedBoxShapes = new java.util.HashMap<>();
+
+    private record BoxKey(float hx, float hy, float hz) {
+    }
+
+    private BoxShape sharedBoxShape(final float hx, final float hy, final float hz) {
+        return this.sharedBoxShapes.computeIfAbsent(new BoxKey(hx, hy, hz), k -> new BoxShape(new Vec3(hx, hy, hz), 0.02f));
+    }
+
+    /**
+     * Reused {@code MassProperties}/{@code Mat44} for {@link #setMassProperties}
+     * (server thread only): avoids a native allocation pair per body per tick.
+     */
+    private final MassProperties massPropsScratch = new MassProperties();
+    private final Mat44 inertiaScratch = new Mat44(
+            0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 1f);
+
+    /**
      * Batch variant of {@link #bi}: pose/velocity of ALL tracked bodies is read
      * with one JNI call per quantity per step instead of one call (plus wrapper
      * allocations) per body per query.
@@ -600,8 +626,9 @@ public final class JoltPhysicsScene {
             return;
         }
         final Body body = sb.body;
-        final RVec3 pos = body.getPosition();
-        final Quat rot = body.getRotation();
+        final RVec3 pos = this.tmpCom.get();
+        final Quat rot = this.tmpQuat.get();
+        body.getPositionAndRotation(pos, rot);
         store.p1 = pos.xx();
         store.p2 = pos.yy();
         store.p3 = pos.zz();
@@ -656,15 +683,29 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final MassProperties mp = new MassProperties();
+        // Reused across calls: mass stats arrive every tick per body, and the old
+        // code allocated a MassProperties + Mat44 + varargs float[] per call.
+        // Memory layout preserved from the old varargs sequence.
+        final MassProperties mp = this.massPropsScratch;
         mp.setMass((float) mass);
-        // Mat44's varargs constructor expects 16 floats in column-major order
-        mp.setInertia(new Mat44(
-                (float) inertiaTensor.m00(), (float) inertiaTensor.m10(), (float) inertiaTensor.m20(), 0.0f,
-                (float) inertiaTensor.m01(), (float) inertiaTensor.m11(), (float) inertiaTensor.m21(), 0.0f,
-                (float) inertiaTensor.m02(), (float) inertiaTensor.m12(), (float) inertiaTensor.m22(), 0.0f,
-                0.0f, 0.0f, 0.0f, 1.0f
-        ));
+        final Mat44 inertia = this.inertiaScratch;
+        inertia.setElement(0, 0, (float) inertiaTensor.m00());
+        inertia.setElement(0, 1, (float) inertiaTensor.m10());
+        inertia.setElement(0, 2, (float) inertiaTensor.m20());
+        inertia.setElement(0, 3, 0.0f);
+        inertia.setElement(1, 0, (float) inertiaTensor.m01());
+        inertia.setElement(1, 1, (float) inertiaTensor.m11());
+        inertia.setElement(1, 2, (float) inertiaTensor.m21());
+        inertia.setElement(1, 3, 0.0f);
+        inertia.setElement(2, 0, (float) inertiaTensor.m02());
+        inertia.setElement(2, 1, (float) inertiaTensor.m12());
+        inertia.setElement(2, 2, (float) inertiaTensor.m22());
+        inertia.setElement(2, 3, 0.0f);
+        inertia.setElement(3, 0, 0.0f);
+        inertia.setElement(3, 1, 0.0f);
+        inertia.setElement(3, 2, 0.0f);
+        inertia.setElement(3, 3, 1.0f);
+        mp.setInertia(inertia);
         motion.setMassProperties(ALLOWED_DOFS_ALL, mp);
     }
 
@@ -673,8 +714,7 @@ public final class JoltPhysicsScene {
         if (sb == null) {
             return;
         }
-        this.bi.setPositionAndRotation(sb.joltId, new RVec3(x, y, z),
-                new Quat((float) i, (float) j, (float) k, (float) r), EActivation.Activate);
+        this.bi.setPositionAndRotation(sb.joltId, x, y, z, (float) i, (float) j, (float) k, (float) r, EActivation.Activate);
         sb.snapGen = 0;
     }
 
@@ -705,14 +745,15 @@ public final class JoltPhysicsScene {
             bay = sb.snapAy;
             baz = sb.snapAz;
         } else {
-            final Vec3 lin = body.getLinearVelocity();
-            final Vec3 ang = body.getAngularVelocity();
-            bvx = lin.getX();
-            bvy = lin.getY();
-            bvz = lin.getZ();
-            bax = ang.getX();
-            bay = ang.getY();
-            baz = ang.getZ();
+            final Vec3 v = this.tmpVec.get();
+            body.getLinearVelocity(v);
+            bvx = v.getX();
+            bvy = v.getY();
+            bvz = v.getZ();
+            body.getAngularVelocity(v);
+            bax = v.getX();
+            bay = v.getY();
+            baz = v.getZ();
         }
         bvx += (float) lx;
         bvy += (float) ly;
@@ -720,7 +761,7 @@ public final class JoltPhysicsScene {
         bax += (float) ax;
         bay += (float) ay;
         baz += (float) az;
-        this.bi.setLinearAndAngularVelocity(sb.joltId, new Vec3(bvx, bvy, bvz), new Vec3(bax, bay, baz));
+        this.bi.setLinearAndAngularVelocity(sb.joltId, bvx, bvy, bvz, bax, bay, baz);
         if (fresh) {
             sb.snapVx = bvx;
             sb.snapVy = bvy;
@@ -745,7 +786,8 @@ public final class JoltPhysicsScene {
             store.p3 = sb.snapVz;
             return;
         }
-        final Vec3 v = sb.body.getLinearVelocity();
+        final Vec3 v = this.tmpVec.get();
+        sb.body.getLinearVelocity(v);
         store.p1 = v.getX();
         store.p2 = v.getY();
         store.p3 = v.getZ();
@@ -762,7 +804,8 @@ public final class JoltPhysicsScene {
             store.p3 = sb.snapAz;
             return;
         }
-        final Vec3 v = sb.body.getAngularVelocity();
+        final Vec3 v = this.tmpVec.get();
+        sb.body.getAngularVelocity(v);
         store.p1 = v.getX();
         store.p2 = v.getY();
         store.p3 = v.getZ();
@@ -782,18 +825,26 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final Quat rot = body.getRotation();
+        final Quat rot = this.tmpQuat.get();
+        body.getRotation(rot);
         final float qx = rot.getX();
         final float qy = rot.getY();
         final float qz = rot.getZ();
         final float qw = rot.getW();
 
-        final Vec3 impulse = rotate((float) fx, (float) fy, (float) fz, qx, qy, qz, qw);
-        final Vec3 offset = rotate((float) x, (float) y, (float) z, qx, qy, qz, qw);
-        final RVec3 com = body.getCenterOfMassPosition();
+        float[] r = this.rotateInto((float) fx, (float) fy, (float) fz, qx, qy, qz, qw);
+        final float impX = r[0], impY = r[1], impZ = r[2];
+        r = this.rotateInto((float) x, (float) y, (float) z, qx, qy, qz, qw);
+        final float offX = r[0], offY = r[1], offZ = r[2];
+        final RVec3 com = this.tmpCom.get();
+        body.getCenterOfMassPosition(com);
 
         // Jolt does not wake bodies on AddImpulse; activation is required separately
-        body.addImpulse(impulse, new RVec3(com.xx() + offset.getX(), com.yy() + offset.getY(), com.zz() + offset.getZ()));
+        final Vec3 imp = this.tmpVec.get();
+        imp.set(impX, impY, impZ);
+        final RVec3 point = this.tmpPoint.get();
+        point.set(com.xx() + offX, com.yy() + offY, com.zz() + offZ);
+        body.addImpulse(imp, point);
         sb.snapGen = 0; // impulse changed the velocity
         if (wakeUp) {
             this.bi.activateBody(sb.joltId);
@@ -811,37 +862,50 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final Quat rot = body.getRotation();
+        final Quat rot = this.tmpQuat.get();
+        body.getRotation(rot);
         final float rotX = rot.getX();
         final float rotY = rot.getY();
         final float rotZ = rot.getZ();
         final float rotW = rot.getW();
 
-        final Vec3 impulse = rotate((float) fx, (float) fy, (float) fz, rotX, rotY, rotZ, rotW);
-        body.addImpulse(impulse.getX(), impulse.getY(), impulse.getZ());
-        body.addAngularImpulse(rotate((float) tx, (float) ty, (float) tz, rotX, rotY, rotZ, rotW));
+        float[] r = this.rotateInto((float) fx, (float) fy, (float) fz, rotX, rotY, rotZ, rotW);
+        body.addImpulse(r[0], r[1], r[2]);
+        r = this.rotateInto((float) tx, (float) ty, (float) tz, rotX, rotY, rotZ, rotW);
+        body.addAngularImpulse(r[0], r[1], r[2]);
         sb.snapGen = 0; // impulse changed the velocity
         if (wakeUp) {
             this.bi.activateBody(sb.joltId);
         }
     }
 
-    private static Vec3 rotate(final float vx, final float vy, final float vz,
-                               final Quat q) {
-        return rotate(vx, vy, vz, q.getX(), q.getY(), q.getZ(), q.getW());
-    }
+    /**
+     * Scratch buffer for {@link #rotateInto}; ThreadLocal because callers run
+     * both on the server thread and on buoyancy/Jolt job threads.
+     */
+    private final ThreadLocal<float[]> rotateOut = ThreadLocal.withInitial(() -> new float[3]);
+    private final ThreadLocal<Quat> tmpQuat = ThreadLocal.withInitial(Quat::new);
+    private final ThreadLocal<RVec3> tmpCom = ThreadLocal.withInitial(RVec3::new);
+    private final ThreadLocal<RVec3> tmpPoint = ThreadLocal.withInitial(RVec3::new);
+    private final ThreadLocal<Vec3> tmpVec = ThreadLocal.withInitial(Vec3::new);
 
-    private static Vec3 rotate(final float vx, final float vy, final float vz,
+    /**
+     * Rotates a vector by a quaternion, writing the result into a per-thread
+     * scratch buffer (allocation-free). The result is valid only until the next
+     * call on the same thread — copy the components out before rotating again.
+     */
+    private float[] rotateInto(final float vx, final float vy, final float vz,
                                final float qx, final float qy, final float qz, final float qw) {
         // t = 2 * cross(q.xyz, v)
         final float tx = 2.0f * (qy * vz - qz * vy);
         final float ty = 2.0f * (qz * vx - qx * vz);
         final float tz = 2.0f * (qx * vy - qy * vx);
         // v + w*t + cross(q.xyz, t)
-        return new Vec3(
-                vx + qw * tx + (qy * tz - qz * ty),
-                vy + qw * ty + (qz * tx - qx * tz),
-                vz + qw * tz + (qx * ty - qy * tx));
+        final float[] out = this.rotateOut.get();
+        out[0] = vx + qw * tx + (qy * tz - qz * ty);
+        out[1] = vy + qw * ty + (qz * tx - qx * tz);
+        out[2] = vz + qw * tz + (qx * ty - qy * tx);
+        return out;
     }
 
     /**
@@ -854,9 +918,11 @@ public final class JoltPhysicsScene {
         if (sb == null) {
             return new RVec3(x, y, z);
         }
-        final Vec3 offset = rotate((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z),
-                sb.body.getRotation().conjugated());
-        return new RVec3(offset.getX(), offset.getY(), offset.getZ());
+        final Quat rot = this.tmpQuat.get();
+        sb.body.getRotation(rot);
+        final float[] r = this.rotateInto((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z),
+                -rot.getX(), -rot.getY(), -rot.getZ(), rot.getW());
+        return new RVec3(r[0], r[1], r[2]);
     }
 
     //endregion
@@ -1467,14 +1533,14 @@ public final class JoltPhysicsScene {
                         }
                     }
 
-                    // The slab needs its OWN box shape sized to the merge вЂ” reusing
+                    // The slab needs its OWN box shape sized to the merge — reusing
                     // the unit box would leave collision only in its center cell.
+                    // Shapes are shared by size across the whole world.
                     final float sx = (x1 - bx + 1) * 0.5f;
                     final float sz = (z1 - bz + 1) * 0.5f;
 
-                    final Vec3 mutable = new Vec3(sx, 0.5f, sz);
-                    final BoxShape slabShape = new BoxShape(mutable, 0.02f);
-                    mutable.set(
+                    final BoxShape slabShape = this.sharedBoxShape(sx, 0.5f, sz);
+                    final Vec3 mutable = new Vec3(
                             baseX + bx + sx,
                             baseY + by + 0.5f,
                             baseZ + bz + sz
@@ -1771,7 +1837,7 @@ public final class JoltPhysicsScene {
             final float speedSq = vx * vx + vy * vy + vz * vz;
             if (speedSq > 144.0f) {
                 final float scale = 12.0f / (float) Math.sqrt(speedSq);
-                this.bi.setLinearVelocity(sb.joltId, new Vec3(vx * scale, vy * scale, vz * scale));
+                this.bi.setLinearVelocity(sb.joltId, vx * scale, vy * scale, vz * scale);
                 sb.snapVx = vx * scale;
                 sb.snapVy = vy * scale;
                 sb.snapVz = vz * scale;
@@ -2063,14 +2129,14 @@ public final class JoltPhysicsScene {
             avz = ang.getZ();
         }
 
-        final RVec3 tmpPoint = this.tmpPoint.get();
-        final Vec3 tmpForce = this.tmpForce.get();
-
         // Rotated unit axes give the world-space Y extent of every child cube:
         // an extent that stays correct (and smooth) for any body orientation.
-        final double halfY = 0.5 * (Math.abs(rotate(1.0f, 0.0f, 0.0f, qx, qy, qz, qw).getY())
-                + Math.abs(rotate(0.0f, 1.0f, 0.0f, qx, qy, qz, qw).getY())
-                + Math.abs(rotate(0.0f, 0.0f, 1.0f, qx, qy, qz, qw).getY()));
+        float[] r = this.rotateInto(1.0f, 0.0f, 0.0f, qx, qy, qz, qw);
+        final double xAxY = r[1];
+        r = this.rotateInto(0.0f, 1.0f, 0.0f, qx, qy, qz, qw);
+        final double yAxY = r[1];
+        r = this.rotateInto(0.0f, 0.0f, 1.0f, qx, qy, qz, qw);
+        final double halfY = 0.5 * (Math.abs(xAxY) + Math.abs(yAxY) + Math.abs(r[1]));
 
         // Accumulated submerged volume and its centroid: the float force is applied
         // at the centroid of the submerged part, so a tilted body gets a smooth
@@ -2093,10 +2159,10 @@ public final class JoltPhysicsScene {
             final double lpy = c.by + 0.5 - sb.centerOfMass.y;
             final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
 
-            final Vec3 worldOffset = rotate((float) lpx, (float) lpy, (float) lpz, qx, qy, qz, qw);
-            final double wx = comX + worldOffset.getX();
-            final double wy = comY + worldOffset.getY();
-            final double wz = comZ + worldOffset.getZ();
+            r = this.rotateInto((float) lpx, (float) lpy, (float) lpz, qx, qy, qz, qw);
+            final double wx = comX + r[0];
+            final double wy = comY + r[1];
+            final double wz = comZ + r[2];
 
             final int wbx = floor(wx);
             final int wby = floor(wy);
@@ -2130,9 +2196,8 @@ public final class JoltPhysicsScene {
             final double vx = lvx + avy * rz - avz * ry;
             final double vy = lvy + avz * rx - avx * rz;
             final double vz = lvz + avx * ry - avy * rx;
-            tmpPoint.set(wx, midY, wz);
-            tmpForce.set((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume));
-            body.addForce(tmpForce, tmpPoint);
+            body.addForce((float) (-vx * 1.7 * volume), (float) (-vy * 1.7 * volume), (float) (-vz * 1.7 * volume),
+                    wx, midY, wz);
 
             // accumulate submerged volume for the single centroid float force
             floatVolume += volume;
@@ -2144,26 +2209,28 @@ public final class JoltPhysicsScene {
         if (floatVolume > 0.0) {
             // Float applied at the centroid of the submerged volume: zero torque
             // when level, smooth righting torque when tilted — stable flotation.
-            tmpPoint.set((float) (centroidX / floatVolume),
-                    (float) (centroidY / floatVolume),
-                    (float) (centroidZ / floatVolume));
             final float buoyancyK = (float) (-this.gravityY * FLUID_DENSITY);
-            tmpForce.set(0.0f, (float) (buoyancyK * floatVolume), 0.0f);
-            body.addForce(tmpForce, tmpPoint);
+            body.addForce(0.0f, (float) (buoyancyK * floatVolume), 0.0f,
+                    centroidX / floatVolume, centroidY / floatVolume, centroidZ / floatVolume);
         }
     }
 
     private static int floor(final double v) {
         return (int) Math.floor(v);
     }
-
-    // Reusable wrappers for the buoyancy hot path; ThreadLocal because the buoyancy
-    // work is distributed across worker threads.
-    private final ThreadLocal<Vec3> tmpForce = ThreadLocal.withInitial(Vec3::new);
-    private final ThreadLocal<RVec3> tmpPoint = ThreadLocal.withInitial(RVec3::new);
     //endregion
 
     //region Contraption motion
+
+    // Reusable objects for updateContraptionMotion (server thread only).
+    private final Quaterniond tmpParentRot = new Quaterniond();
+    private final Quaterniond tmpWorldRot = new Quaterniond();
+    private final Quaterniond tmpVelRot = new Quaterniond();
+    private final Vector3d tmpWorldRotVec = new Vector3d();
+    private final Vector3d tmpWorldLin = new Vector3d();
+    private final Vector3d tmpWorldAng = new Vector3d();
+    private final RVec3 tmpMovePos = new RVec3();
+    private final Quat tmpMoveRot = new Quat();
 
     private void updateContraptionMotion(final float dt) {
         for (final SableBody sb : this.bodies.values()) {
@@ -2171,46 +2238,70 @@ public final class JoltPhysicsScene {
                 continue;
             }
 
-            Quaterniondc parentRot = null;
+            final boolean hasParent;
             double px = 0.0, py = 0.0, pz = 0.0;
+            float pqx = 0.0f, pqy = 0.0f, pqz = 0.0f, pqw = 1.0f;
             if (sb.mountId != -1) {
                 final SableBody mount = this.bodies.get(sb.mountId);
                 if (mount != null) {
-                    final Body mountBody = mount.body;
-                    final RVec3 mp = mountBody.getCenterOfMassPosition();
-                    final Quat mr = mountBody.getRotation();
-                    px = mp.xx();
-                    py = mp.yy();
-                    pz = mp.zz();
-                    parentRot = new Quaterniond(mr.getX(), mr.getY(), mr.getZ(), mr.getW());
+                    hasParent = true;
+                    if (mount.snapGen == this.snapshotGen && this.snapshotCount > 0) {
+                        px = mount.snapComX;
+                        py = mount.snapComY;
+                        pz = mount.snapComZ;
+                        pqx = mount.snapQx;
+                        pqy = mount.snapQy;
+                        pqz = mount.snapQz;
+                        pqw = mount.snapQw;
+                    } else {
+                        final Body mountBody = mount.body;
+                        final RVec3 mp = this.tmpCom.get();
+                        mountBody.getCenterOfMassPosition(mp);
+                        px = mp.xx();
+                        py = mp.yy();
+                        pz = mp.zz();
+                        final Quat mr = this.tmpQuat.get();
+                        mountBody.getRotation(mr);
+                        pqx = mr.getX();
+                        pqy = mr.getY();
+                        pqz = mr.getZ();
+                        pqw = mr.getW();
+                    }
+                } else {
+                    hasParent = false;
                 }
+            } else {
+                hasParent = false;
             }
 
             double wx;
             double wy;
             double wz;
             Quaterniond wrot;
-            if (parentRot != null) {
-                final org.joml.Vector3d off = parentRot.transform(new org.joml.Vector3d(sb.relPos.x, sb.relPos.y, sb.relPos.z));
-                wx = px + off.x;
-                wy = py + off.y;
-                wz = pz + off.z;
-                wrot = new Quaterniond(parentRot).mul(sb.relRot);
+            if (hasParent) {
+                this.tmpParentRot.set(pqx, pqy, pqz, pqw);
+                this.tmpWorldRotVec.set(sb.relPos.x, sb.relPos.y, sb.relPos.z);
+                this.tmpParentRot.transform(this.tmpWorldRotVec);
+                wx = px + this.tmpWorldRotVec.x;
+                wy = py + this.tmpWorldRotVec.y;
+                wz = pz + this.tmpWorldRotVec.z;
+                wrot = this.tmpWorldRot.set(this.tmpParentRot).mul(sb.relRot);
             } else {
                 wx = sb.relPos.x;
                 wy = sb.relPos.y;
                 wz = sb.relPos.z;
-                wrot = new Quaterniond(sb.relRot);
+                wrot = this.tmpWorldRot.set(sb.relRot);
             }
 
-            final org.joml.Vector3d worldLin = wrot.transform(new org.joml.Vector3d(sb.linVel));
-            final org.joml.Vector3d worldAng = wrot.transform(new org.joml.Vector3d(sb.angVel));
+            this.tmpVelRot.set(wrot).transform(this.tmpWorldLin.set(sb.linVel));
+            this.tmpVelRot.transform(this.tmpWorldAng.set(sb.angVel));
 
-            this.bi.moveKinematic(sb.joltId, new RVec3(wx, wy, wz),
-                    new Quat((float) wrot.x, (float) wrot.y, (float) wrot.z, (float) wrot.w), dt);
+            this.tmpMovePos.set(wx, wy, wz);
+            this.tmpMoveRot.set((float) wrot.x, (float) wrot.y, (float) wrot.z, (float) wrot.w);
+            this.bi.moveKinematic(sb.joltId, this.tmpMovePos, this.tmpMoveRot, dt);
             this.bi.setLinearAndAngularVelocity(sb.joltId,
-                    new Vec3((float) worldLin.x, (float) worldLin.y, (float) worldLin.z),
-                    new Vec3((float) worldAng.x, (float) worldAng.y, (float) worldAng.z));
+                    (float) this.tmpWorldLin.x, (float) this.tmpWorldLin.y, (float) this.tmpWorldLin.z,
+                    (float) this.tmpWorldAng.x, (float) this.tmpWorldAng.y, (float) this.tmpWorldAng.z);
         }
     }
 
@@ -2228,22 +2319,30 @@ public final class JoltPhysicsScene {
      * Each collision is formatted as:
      * [body_a, body_b, force_amount, local_normal_a, local_normal_b, local_point_a, local_point_b]
      */
+    /** Reused output buffer of {@link #clearCollisions} (server thread only). */
+    private final double[] collisionOut = new double[100 * 15];
+    private int collisionCount;
+
     public double[] clearCollisions() {
         final int max = 100;
-        final double[] arr;
         synchronized (this.reportedLock) {
             if (this.reportedCollisions.size() > max) {
                 this.reportedCollisions.subList(max, this.reportedCollisions.size()).clear();
             }
-            arr = new double[this.reportedCollisions.size() * 15];
+            this.collisionCount = this.reportedCollisions.size();
             int i = 0;
             for (final double[] rec : this.reportedCollisions) {
-                System.arraycopy(rec, 0, arr, i, 15);
+                System.arraycopy(rec, 0, this.collisionOut, i, 15);
                 i += 15;
             }
             this.reportedCollisions.clear();
         }
-        return arr;
+        return this.collisionOut;
+    }
+
+    /** Number of valid 15-double records in the last {@link #clearCollisions} result. */
+    public int lastCollisionCount() {
+        return this.collisionCount;
     }
 
     void reportCollision(final double[] rec) {
@@ -2299,7 +2398,7 @@ public final class JoltPhysicsScene {
 
     private int createRopePoint(final double x, final double y, final double z, final double pointRadius) {
         final BodyCreationSettings bcs = new BodyCreationSettings(
-                new com.github.stephengold.joltjni.BoxShape(new Vec3((float) pointRadius, (float) pointRadius, (float) pointRadius), 0.02f),
+                this.sharedBoxShape((float) pointRadius, (float) pointRadius, (float) pointRadius),
                 new RVec3(x, y, z), Quat.sIdentity(), EMotionType.Dynamic, LAYER_ROPE);
         bcs.setLinearDamping((float) (this.universalDrag + 6.0));
         bcs.setAngularDamping((float) this.universalDrag);
@@ -2638,24 +2737,28 @@ public final class JoltPhysicsScene {
         private void invokeCallback(final JoltVoxelColliderData entry, final Child c, final Child other,
                                     final Body body, final ContactManifold manifold, final ContactSettings settings,
                                     final boolean isFirst) {
-            final Vec3 normal = manifold.getWorldSpaceNormal();
-            final Vec3 tangent;
+            float tanX = 0f, tanY = 0f, tanZ = 0f;
             try {
-                final Vector3d point = new Vector3d(c.bx + 0.5, c.by + 0.5, c.bz + 0.5);
                 final int ox = other != null ? other.bx : 0;
                 final int oy = other != null ? other.by : 0;
                 final int oz = other != null ? other.bz : 0;
 
                 final double[] result = entry.contactEvents.onCollision(
                         c.bx, c.by, c.bz, ox, oy, oz,
-                        point.x, point.y, point.z,
+                        c.bx + 0.5, c.by + 0.5, c.bz + 0.5,
                         manifold.getPenetrationDepth(),
                         other != null);
                 if (result == null || result.length < 4) {
                     return;
                 }
-                final Quat rot = body.getRotation();
-                tangent = rotate((float) result[0], (float) result[1], (float) result[2], rot);
+                final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
+                body.getRotation(rot);
+                final float[] r = JoltPhysicsScene.this.rotateInto(
+                        (float) result[0], (float) result[1], (float) result[2],
+                        rot.getX(), rot.getY(), rot.getZ(), rot.getW());
+                tanX = r[0];
+                tanY = r[1];
+                tanZ = r[2];
                 final boolean remove = result[3] > 0.0;
                 if (remove) {
                     settings.setIsSensor(true);
@@ -2669,33 +2772,37 @@ public final class JoltPhysicsScene {
             final float sign = isFirst ? -1.0f : 1.0f;
             final Vec3 existing = settings.getRelativeLinearSurfaceVelocity();
             settings.setRelativeLinearSurfaceVelocity(new Vec3(
-                    existing.getX() + sign * tangent.getX(),
-                    existing.getY() + sign * tangent.getY(),
-                    existing.getZ() + sign * tangent.getZ()));
+                    existing.getX() + sign * tanX,
+                    existing.getY() + sign * tanY,
+                    existing.getZ() + sign * tanZ));
         }
 
         private void applySurfaceVelocity(final SableBody sb, final Body body, final ContactManifold manifold, final ContactSettings settings, final boolean isFirst) {
             if (sb == null || sb.kind != SableBody.Kind.CONTRAPTION || (sb.linVel.lengthSquared() == 0 && sb.angVel.lengthSquared() == 0)) {
                 return;
             }
-            final Quat rot = body.getRotation();
-            final Vec3 lin = rotate((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z, rot);
-            final Vec3 ang = rotate((float) sb.angVel.x, (float) sb.angVel.y, (float) sb.angVel.z, rot);
+            final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
+            body.getRotation(rot);
+            final float qx = rot.getX(), qy = rot.getY(), qz = rot.getZ(), qw = rot.getW();
+            float[] r = JoltPhysicsScene.this.rotateInto((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z, qx, qy, qz, qw);
+            final float linX = r[0], linY = r[1], linZ = r[2];
+            r = JoltPhysicsScene.this.rotateInto((float) sb.angVel.x, (float) sb.angVel.y, (float) sb.angVel.z, qx, qy, qz, qw);
+            final float angX = r[0], angY = r[1], angZ = r[2];
 
             // approximate surface velocity at the body center; direction relative to body 1 / 2
             final float sign = isFirst ? -1.0f : 1.0f;
             final Vec3 existing = settings.getRelativeLinearSurfaceVelocity();
             settings.setRelativeLinearSurfaceVelocity(new Vec3(
-                    existing.getX() + sign * lin.getX(),
-                    existing.getY() + sign * lin.getY(),
-                    existing.getZ() + sign * lin.getZ()));
+                    existing.getX() + sign * linX,
+                    existing.getY() + sign * linY,
+                    existing.getZ() + sign * linZ));
 
-            if (ang.lengthSq() > 1.0e-9f) {
+            if (angX * angX + angY * angY + angZ * angZ > 1.0e-9f) {
                 final Vec3 existingAng = settings.getRelativeAngularSurfaceVelocity();
                 settings.setRelativeAngularSurfaceVelocity(new Vec3(
-                        existingAng.getX() + sign * ang.getX(),
-                        existingAng.getY() + sign * ang.getY(),
-                        existingAng.getZ() + sign * ang.getZ()));
+                        existingAng.getX() + sign * angX,
+                        existingAng.getY() + sign * angY,
+                        existingAng.getZ() + sign * angZ));
             }
         }
 
@@ -2710,10 +2817,11 @@ public final class JoltPhysicsScene {
             rec[0] = id1;
             rec[1] = id2;
 
-            final RVec3 com1 = body1.getCenterOfMassPosition();
-            final RVec3 com2 = body2.getCenterOfMassPosition();
-            final double com1x = com1.xx(), com1y = com1.yy(), com1z = com1.zz();
-            final double com2x = com2.xx(), com2y = com2.yy(), com2z = com2.zz();
+            final RVec3 com = JoltPhysicsScene.this.tmpCom.get();
+            body1.getCenterOfMassPosition(com);
+            final double com1x = com.xx(), com1y = com.yy(), com1z = com.zz();
+            body2.getCenterOfMassPosition(com);
+            final double com2x = com.xx(), com2y = com.yy(), com2z = com.zz();
 
             final Vec3 n = manifold.getWorldSpaceNormal();
             final double nx = n.getX(), ny = n.getY(), nz = n.getZ();
@@ -2747,28 +2855,37 @@ public final class JoltPhysicsScene {
                 }
             }
 
-            final Quat r1 = body1.getRotation();
-            final Quat r2 = body2.getRotation();
-            final Vec3 worldP1 = rotate((float) px1, (float) py1, (float) pz1, r1);
-            final Vec3 worldP2 = rotate((float) px2, (float) py2, (float) pz2, r2);
+            final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
+            body1.getRotation(rot);
+            final float r1qx = rot.getX(), r1qy = rot.getY(), r1qz = rot.getZ(), r1qw = rot.getW();
+            float[] wr = JoltPhysicsScene.this.rotateInto((float) px1, (float) py1, (float) pz1, r1qx, r1qy, r1qz, r1qw);
+            final double wp1x = wr[0], wp1y = wr[1], wp1z = wr[2];
+            body2.getRotation(rot);
+            wr = JoltPhysicsScene.this.rotateInto((float) px2, (float) py2, (float) pz2, rot.getX(), rot.getY(), rot.getZ(), rot.getW());
+            final double wp2x = wr[0], wp2y = wr[1], wp2z = wr[2];
 
-            final double p1x = com1x + worldP1.getX(), p1y = com1y + worldP1.getY(), p1z = com1z + worldP1.getZ();
-            final double p2x = com2x + worldP2.getX(), p2y = com2y + worldP2.getY(), p2z = com2z + worldP2.getZ();
+            final double p1x = com1x + wp1x, p1y = com1y + wp1y, p1z = com1z + wp1z;
+            final double p2x = com2x + wp2x, p2y = com2y + wp2y, p2z = com2z + wp2z;
 
-            final Vec3 v1 = body1.getLinearVelocity();
-            final Vec3 w1 = body1.getAngularVelocity();
-            final Vec3 v2 = body2.getLinearVelocity();
-            final Vec3 w2 = body2.getAngularVelocity();
+            final Vec3 vel = JoltPhysicsScene.this.tmpVec.get();
+            body1.getLinearVelocity(vel);
+            final double v1x = vel.getX(), v1y = vel.getY(), v1z = vel.getZ();
+            body1.getAngularVelocity(vel);
+            final double w1x = vel.getX(), w1y = vel.getY(), w1z = vel.getZ();
+            body2.getLinearVelocity(vel);
+            final double v2x = vel.getX(), v2y = vel.getY(), v2z = vel.getZ();
+            body2.getAngularVelocity(vel);
+            final double w2x = vel.getX(), w2y = vel.getY(), w2z = vel.getZ();
 
             final double r1x = p1x - com1x, r1y = p1y - com1y, r1z = p1z - com1z;
-            final double vp1x = v1.getX() + w1.getY() * r1z - w1.getZ() * r1y;
-            final double vp1y = v1.getY() + w1.getZ() * r1x - w1.getX() * r1z;
-            final double vp1z = v1.getZ() + w1.getX() * r1y - w1.getY() * r1x;
+            final double vp1x = v1x + w1y * r1z - w1z * r1y;
+            final double vp1y = v1y + w1z * r1x - w1x * r1z;
+            final double vp1z = v1z + w1x * r1y - w1y * r1x;
 
             final double r2x = p2x - com2x, r2y = p2y - com2y, r2z = p2z - com2z;
-            final double vp2x = v2.getX() + w2.getY() * r2z - w2.getZ() * r2y;
-            final double vp2y = v2.getY() + w2.getZ() * r2x - w2.getX() * r2z;
-            final double vp2z = v2.getZ() + w2.getX() * r2y - w2.getY() * r2x;
+            final double vp2x = v2x + w2y * r2z - w2z * r2y;
+            final double vp2y = v2y + w2z * r2x - w2x * r2z;
+            final double vp2z = v2z + w2x * r2y - w2y * r2x;
 
             final double relSpeed = Math.abs((vp1x - vp2x) * nx + (vp1y - vp2y) * ny + (vp1z - vp2z) * nz);
             final float invM1 = body1.isDynamic() ? body1.getMotionProperties().getInverseMass() : 0.0f;

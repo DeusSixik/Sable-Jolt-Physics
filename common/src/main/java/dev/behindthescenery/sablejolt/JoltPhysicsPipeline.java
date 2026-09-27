@@ -776,6 +776,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     private final Vector3d tmpLinVel = new Vector3d();
     private final Vector3d tmpAngVel = new Vector3d();
     private final Quaterniond tmpQuat = new Quaterniond();
+    private final Vector3d tmpCollisionPoint = new Vector3d();
 
     private void updateContraptionPoses() {
         final SubLevelPhysicsSystem system = SubLevelPhysicsSystem.require(this.level);
@@ -842,11 +843,12 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         }
 
         final double[] collisions = this.scene().clearCollisions();
+        final int collisionRecords = this.scene().lastCollisionCount();
 
         final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        final Vector3d globalPoint = new Vector3d();
+        final Vector3d globalPoint = this.tmpCollisionPoint;
 
-        for (int i = 0; i < collisions.length / 15; i++) {
+        for (int i = 0; i < collisionRecords; i++) {
             final int base = i * 15;
             // record layout: [idA, idB, force, normalA(3), normalB(3), pointA(3), pointB(3)];
             // normals and point B are unused downstream (same as the rapier pipeline)

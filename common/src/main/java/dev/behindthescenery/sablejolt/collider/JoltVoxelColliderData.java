@@ -22,8 +22,6 @@ import java.util.List;
 @ApiStatus.Internal
 public final class JoltVoxelColliderData implements VoxelColliderData {
 
-    private static final Vec3 SHAPE_POS = new Vec3();
-
     /**
      * The boxes of this collider, formatted [minX, minY, minZ, maxX, maxY, maxZ] within 0-1 block space.
      */
@@ -92,8 +90,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
                     final float hx = Math.max((b.maxX - b.minX) * 0.5f, 0.0001f);
                     final float hy = Math.max((b.maxY - b.minY) * 0.5f, 0.0001f);
                     final float hz = Math.max((b.maxZ - b.minZ) * 0.5f, 0.0001f);
-                    SHAPE_POS.set(hx, hy, hz);
-                    arr[boxIndex] = new BoxShape(SHAPE_POS, 0.025f);
+                    arr[boxIndex] = new BoxShape(hx, hy, hz, 0.025f);
                 }
             }
         }
@@ -107,6 +104,18 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
                 (float) max.x(), (float) max.y(), (float) max.z()
         ));
         this.shapes = null;
+    }
+
+    public void addBox(final double minX, final double minY, final double minZ,
+                       final double maxX, final double maxY, final double maxZ) {
+        this.addBox((float) minX, (float) minY, (float) minZ, (float) maxX, (float) maxY, (float) maxZ);
+    }
+
+    public void addBox(final float minX, final float minY, final float minZ,
+                       final float maxX, final float maxY, final float maxZ) {
+        this.boxes.add(new VoxelBox(
+                minX, minY, minZ, maxX, maxY, maxZ
+        ));
     }
 
     @Override

@@ -20,12 +20,15 @@ import java.util.Objects;
 @ApiStatus.Internal
 public final class PhysicsColliderBlockGetter implements BlockGetter {
 
+    private static final BlockState AIR = Blocks.AIR.defaultBlockState();
+    private static final FluidState EMPTY =  Fluids.EMPTY.defaultFluidState();
+
     private final BlockGetter level;
     private BlockState state;
 
     public PhysicsColliderBlockGetter(final BlockGetter level) {
         this.level = level;
-        this.state = Blocks.AIR.defaultBlockState();
+        this.state = AIR;
     }
 
     public void setup(final BlockState state) {
@@ -39,12 +42,12 @@ public final class PhysicsColliderBlockGetter implements BlockGetter {
 
     @Override
     public @NotNull BlockState getBlockState(@NotNull final BlockPos pos) {
-        return BlockPos.ZERO.equals(pos) ? this.state : Blocks.AIR.defaultBlockState();
+        return BlockPos.ZERO.equals(pos) ? this.state : AIR;
     }
 
     @Override
     public @NotNull FluidState getFluidState(@NotNull final BlockPos pos) {
-        return BlockPos.ZERO.equals(pos) ? this.state.getFluidState() : Fluids.EMPTY.defaultFluidState();
+        return BlockPos.ZERO.equals(pos) ? this.state.getFluidState() : EMPTY;
     }
 
     @Override
