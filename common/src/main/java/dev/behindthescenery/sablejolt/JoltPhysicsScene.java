@@ -2,20 +2,23 @@ package dev.behindthescenery.sablejolt;
 
 import com.github.stephengold.joltjni.*;
 import com.github.stephengold.joltjni.enumerate.EActivation;
-import com.github.stephengold.joltjni.enumerate.EAxis;
 import com.github.stephengold.joltjni.enumerate.EMotionQuality;
 import com.github.stephengold.joltjni.enumerate.EMotionType;
-import com.github.stephengold.joltjni.enumerate.EMotorState;
 import com.github.stephengold.joltjni.enumerate.EOverrideMassProperties;
 import com.github.stephengold.joltjni.enumerate.ESpringMode;
 import com.github.stephengold.joltjni.readonly.ConstBodyIdArray;
 import com.github.stephengold.joltjni.readonly.ConstShape;
+import dev.behindthescenery.sablejolt.collider.JoltVoxelColliderBakery;
 import dev.behindthescenery.sablejolt.collider.JoltVoxelColliderData;
 import dev.ryanhcode.sable.Sable;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
@@ -27,10 +30,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.DoubleBuffer;
 import java.nio.FloatBuffer;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.LinkedHashSet;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -69,13 +70,60 @@ public final class JoltPhysicsScene {
      * rope; Jolt shapes are immutable and reference-counted, so one native
      * instance per size replaces one instance per slab (native memory saver).
      */
-    private final java.util.HashMap<BoxKey, BoxShape> sharedBoxShapes = new java.util.HashMap<>();
+    private final Object2ObjectOpenHashMap<BoxKey, BoxShape> sharedBoxShapes = new Object2ObjectOpenHashMap<>();
 
-    private record BoxKey(float hx, float hy, float hz) {
+    private static final class BoxKey {
+        private float hx;
+        private float hy;
+        private float hz;
+
+        private BoxKey() {
+            this(0, 0, 0);
+        }
+
+        private BoxKey(float hx, float hy, float hz) {
+            this.hx = hx;
+            this.hy = hy;
+            this.hz = hz;
+        }
+
+        private BoxKey set(float hx, float hy, float hz) {
+            this.hx = hx;
+            this.hy = hy;
+            this.hz = hz;
+            return this;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (obj == this) return true;
+            if (!(obj instanceof BoxKey that)) return false;
+            return this.hx == that.hx &&
+                    this.hy == that.hy &&
+                    this.hz == that.hz;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Float.floatToRawIntBits(hx);
+            result = 31 * result + Float.floatToRawIntBits(hy);
+            result = 31 * result + Float.floatToRawIntBits(hz);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "BoxKey[" +
+                    "hx=" + hx + ", " +
+                    "hy=" + hy + ", " +
+                    "hz=" + hz + ']';
+        }
     }
 
+    private static ThreadLocal<BoxKey> BOX_KEY = ThreadLocal.withInitial(BoxKey::new);
+
     private BoxShape sharedBoxShape(final float hx, final float hy, final float hz) {
-        return this.sharedBoxShapes.computeIfAbsent(new BoxKey(hx, hy, hz), k -> new BoxShape(new Vec3(hx, hy, hz), 0.02f));
+        return this.sharedBoxShapes.computeIfAbsent(new BoxKey(hx, hy, hz), k -> new BoxShape(hx, hy, hz, 0.02f));
     }
 
     /**
@@ -98,6 +146,72 @@ public final class JoltPhysicsScene {
     private BodyIdArray snapshotIds;
     private int snapshotCount;
     private long snapshotGen = 1;
+
+    /**
+     * Bodies currently dragged by the creative grip (physics staff): gravity is
+     * switched off so weight can neither pull nor tip the body over, while the
+     * body stays dynamic — contacts still resolve, so it cannot be pushed
+     * through the terrain.
+     */
+    private final IntOpenHashSet creativeDragBodies = new IntOpenHashSet();
+    /**
+     * Dragged bodies whose handle was removed; gravity is restored at the next
+     * step start. Deferred because the staff recreates its constraint every
+     * tick — an immediate restore would flap every tick.
+     */
+    private final IntOpenHashSet creativeRestorePending = new IntOpenHashSet();
+
+    /**
+     * Starts (or confirms) the creative drag of a body. Idempotent per grab.
+     */
+    public void beginCreativeDrag(final int joltId) {
+        this.creativeRestorePending.remove(joltId);
+        if (this.creativeDragBodies.add(joltId)) {
+            final SableBody sb = this.bodiesByJoltId.get(joltId);
+            if (sb != null && sb.body != null) {
+                final var motion = sb.body.getMotionProperties();
+                if (motion != null) {
+                    motion.setGravityFactor(0.0f);
+                }
+            }
+        }
+    }
+
+    /**
+     * Marks the end of a creative drag; gravity is restored in
+     * {@link #flushCreativeRestore} at the next step start.
+     */
+    public void endCreativeDrag(final int joltId) {
+        if (this.creativeDragBodies.contains(joltId)) {
+            this.creativeRestorePending.add(joltId);
+        }
+    }
+
+    public boolean isCreativeDrag(final int joltId) {
+        return this.creativeDragBodies.contains(joltId);
+    }
+
+    private void flushCreativeRestore() {
+        if (this.creativeRestorePending.isEmpty()) {
+            return;
+        }
+        for (final int joltId : this.creativeRestorePending) {
+            this.creativeDragBodies.remove(joltId);
+            try {
+                final SableBody sb = this.bodiesByJoltId.get(joltId);
+                if (sb != null && sb.body != null) {
+                    final var motion = sb.body.getMotionProperties();
+                    if (motion != null) {
+                        motion.setGravityFactor(1.0f);
+                    }
+                }
+            } catch (final Throwable ignored) {
+                // body may be gone already
+            }
+        }
+        this.creativeRestorePending.clear();
+    }
+
     private DoubleBuffer snapshotPos;
     private DoubleBuffer snapshotCom;
     private FloatBuffer snapshotRot;
@@ -107,11 +221,12 @@ public final class JoltPhysicsScene {
     public BodyInterface getBodyInterface() {
         return this.bi;
     }
+
     private final TempAllocator tempAllocator;
     private final JobSystem jobSystem;
     private final JobSystem singleThreadJobSystem;
     private static final int WORKER_THREADS = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
-    private final java.util.concurrent.ExecutorService bodyWorkers = java.util.concurrent.Executors.newFixedThreadPool(
+    private final ExecutorService bodyWorkers = Executors.newFixedThreadPool(
             WORKER_THREADS, r -> {
                 final Thread t = new Thread(r, "sable-jolt-worker");
                 t.setDaemon(true);
@@ -140,9 +255,9 @@ public final class JoltPhysicsScene {
      * Set by the pipeline; used to lazily (re)build collision boxes of entries whose
      * first computation yielded no boxes.
      */
-    private volatile dev.behindthescenery.sablejolt.collider.JoltVoxelColliderBakery colliderBakery;
+    private volatile JoltVoxelColliderBakery colliderBakery;
 
-    public void attachColliderBakery(final dev.behindthescenery.sablejolt.collider.JoltVoxelColliderBakery bakery) {
+    public void attachColliderBakery(final JoltVoxelColliderBakery bakery) {
         this.colliderBakery = bakery;
     }
 
@@ -154,23 +269,23 @@ public final class JoltPhysicsScene {
     private final Long2ObjectOpenHashMap<JointRecord> joints = new Long2ObjectOpenHashMap<>();
     private final Long2ObjectOpenHashMap<RopeStrand> ropes = new Long2ObjectOpenHashMap<>();
 
-    private final Int2ObjectOpenHashMap<org.joml.Quaterniond> angularFollowPrev = new Int2ObjectOpenHashMap<>();
-    private final Int2ObjectOpenHashMap<org.joml.Vector3d> angularCachedOmega = new Int2ObjectOpenHashMap<>();
+    private final Int2ObjectOpenHashMap<Quaterniond> angularFollowPrev = new Int2ObjectOpenHashMap<>();
+    private final Int2ObjectOpenHashMap<Vector3d> angularCachedOmega = new Int2ObjectOpenHashMap<>();
 
-    public org.joml.Quaterniond getAngularFollowPrev(final int joltId) {
+    public Quaterniond getAngularFollowPrev(final int joltId) {
         return this.angularFollowPrev.get(joltId);
     }
 
-    public void setAngularFollowPrev(final int joltId, final org.joml.Quaterniond q) {
-        this.angularFollowPrev.computeIfAbsent(joltId, k -> new org.joml.Quaterniond()).set(q);
+    public void setAngularFollowPrev(final int joltId, final Quaterniond q) {
+        this.angularFollowPrev.computeIfAbsent(joltId, k -> new Quaterniond()).set(q);
     }
 
-    public org.joml.Vector3d getCachedAngularOmega(final int joltId) {
+    public Vector3d getCachedAngularOmega(final int joltId) {
         return this.angularCachedOmega.get(joltId);
     }
 
-    public void setCachedAngularOmega(final int joltId, final org.joml.Vector3d omega) {
-        this.angularCachedOmega.computeIfAbsent(joltId, k -> new org.joml.Vector3d()).set(omega);
+    public void setCachedAngularOmega(final int joltId, final Vector3d omega) {
+        this.angularCachedOmega.computeIfAbsent(joltId, k -> new Vector3d()).set(omega);
     }
 
     public void clearAngularServo(final int joltId) {
@@ -183,7 +298,7 @@ public final class JoltPhysicsScene {
     private final AtomicLong nextRopeId = new AtomicLong(1);
     private final AtomicInteger nextGroupId = new AtomicInteger(1);
 
-    private final ArrayList<double[]> reportedCollisions = new ArrayList<>();
+    private final ObjectArrayList<double[]> reportedCollisions = new ObjectArrayList<>();
 
     /**
      * Guards reportedCollisions: Jolt fires contact callbacks from worker threads
@@ -278,8 +393,8 @@ public final class JoltPhysicsScene {
         // world are measured from its center of mass, and a shifted origin would
         // add a phantom offset to every motor target.
         final BodyCreationSettings bcs = new BodyCreationSettings(
-                new com.github.stephengold.joltjni.BoxShape(new Vec3(0.01f, 0.01f, 0.01f), 0.001f),
-                RVec3.sZero(), Quat.sIdentity(), EMotionType.Static, LAYER_STATIC);
+                new BoxShape(0.01f, 0.01f, 0.01f, 0.001f),
+                0f, 0f, 0f, 0f, 0f, 0f, 1f, EMotionType.Static, LAYER_STATIC);
         final Body body = this.bi.createBody(bcs);
         body.setUserData(-1L);
         this.bi.addBody(body, EActivation.DontActivate);
@@ -347,7 +462,7 @@ public final class JoltPhysicsScene {
          */
         public final Int2ObjectOpenHashMap<Child> childById = new Int2ObjectOpenHashMap<>();
 
-        public         int mountId = -1;
+        public int mountId = -1;
         public final Vector3d relPos = new Vector3d();
         public final Quaterniond relRot = new Quaterniond(1.0, 0.0, 0.0, 0.0);
         public final Vector3d linVel = new Vector3d();
@@ -357,8 +472,7 @@ public final class JoltPhysicsScene {
         // Batch-read body state (see refreshBodySnapshot). Valid only while
         // snapGen matches the scene's snapshotGen; otherwise direct JNI reads
         // are used instead.
-        long snapGen;
-        int snapIndex;
+        long snapGen;        int snapIndex;
         double snapX;
         double snapY;
         double snapZ;
@@ -375,6 +489,14 @@ public final class JoltPhysicsScene {
         float snapAx;
         float snapAy;
         float snapAz;
+
+        // Deepest contact penetration this step (plus its outward normal) for
+        // creatively dragged bodies — used by the end-of-step push-out.
+        // Reset in flushDirty, accumulated in the contact listener.
+        double dragPenDepth;
+        double dragPenNx;
+        double dragPenNy;
+        double dragPenNz;
 
         // Dedup state of the last shape rebuild: if none of these inputs changed,
         // the rebuild is skipped (mass-stat updates arrive every tick).
@@ -444,7 +566,7 @@ public final class JoltPhysicsScene {
          * Mesh sub-shape IDs are triangle indices directly.
          */
 
-        final ArrayList<Child> children = new ArrayList<>();
+        final ObjectArrayList<Child> children = new ObjectArrayList<>();
 
         /**
          * Full sub-shape ID → leaf child (see SableBody.childById); the chunk shape
@@ -483,10 +605,10 @@ public final class JoltPhysicsScene {
         public Constraint constraint;
     }
 
-    public     static final class RopeStrand {
-        final ArrayList<Integer> points = new ArrayList<>();
-        final ArrayList<Body> pointBodies = new ArrayList<>();
-        final ArrayList<DistanceConstraint> joints = new ArrayList<>();
+    public static final class RopeStrand {
+        final IntArrayList points = new IntArrayList();
+        final ObjectArrayList<Body> pointBodies = new ObjectArrayList<>();
+        final ObjectArrayList<DistanceConstraint> joints = new ObjectArrayList<>();
         double pointRadius;
         double firstJointLength;
         @Nullable RopeAttachment start;
@@ -501,8 +623,8 @@ public final class JoltPhysicsScene {
         final MutableCompoundShape shape = new MutableCompoundShape();
         final BodyCreationSettings bcs = new BodyCreationSettings(
                 shape,
-                new RVec3(pos.x(), pos.y(), pos.z()),
-                new Quat((float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w()),
+                pos.x(), pos.y(), pos.z(),
+                (float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w(),
                 kind == SableBody.Kind.CONTRAPTION ? EMotionType.Kinematic : EMotionType.Dynamic,
                 layer);
         bcs.setLinearDamping((float) this.universalDrag);
@@ -530,6 +652,8 @@ public final class JoltPhysicsScene {
         this.bodies.remove(sb.runtimeId);
         this.bodiesByJoltId.remove(sb.joltId);
         this.dirtyBodies.remove(sb);
+        this.creativeDragBodies.remove(sb.joltId);
+        this.creativeRestorePending.remove(sb.joltId);
         if (sb.mountId != -1) {
             final SableBody mount = this.bodies.get(sb.mountId);
             if (mount != null) {
@@ -555,9 +679,9 @@ public final class JoltPhysicsScene {
         final SableBody sb = this.createBody(SableBody.Kind.BOX, id, pos, rot, LAYER_MOVING);
 
         final BodyCreationSettings bcs = new BodyCreationSettings(
-                new BoxShape(new Vec3((float) hx, (float) hy, (float) hz), 0.025f),
-                new RVec3(pos.x(), pos.y(), pos.z()),
-                new Quat((float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w()),
+                new BoxShape((float) hx, (float) hy, (float) hz, 0.025f),
+                pos.x(), pos.y(), pos.z(),
+                (float) rot.x(), (float) rot.y(), (float) rot.z(), (float) rot.w(),
                 EMotionType.Dynamic, LAYER_MOVING);
         bcs.setMotionQuality(EMotionQuality.LinearCast);
         bcs.setFriction(0.45f);
@@ -678,7 +802,7 @@ public final class JoltPhysicsScene {
         }
 
         final Body body = sb.body;
-        final var motion = body.getMotionProperties();
+        final MotionProperties motion = body.getMotionProperties();
         if (motion == null) {
             return;
         }
@@ -832,10 +956,10 @@ public final class JoltPhysicsScene {
         final float qz = rot.getZ();
         final float qw = rot.getW();
 
-        float[] r = this.rotateInto((float) fx, (float) fy, (float) fz, qx, qy, qz, qw);
-        final float impX = r[0], impY = r[1], impZ = r[2];
+        Vector3f r = this.rotateInto((float) fx, (float) fy, (float) fz, qx, qy, qz, qw);
+        final float impX = r.x, impY = r.y, impZ = r.z;
         r = this.rotateInto((float) x, (float) y, (float) z, qx, qy, qz, qw);
-        final float offX = r[0], offY = r[1], offZ = r[2];
+        final float offX = r.x, offY = r.y, offZ = r.z;
         final RVec3 com = this.tmpCom.get();
         body.getCenterOfMassPosition(com);
 
@@ -869,10 +993,10 @@ public final class JoltPhysicsScene {
         final float rotZ = rot.getZ();
         final float rotW = rot.getW();
 
-        float[] r = this.rotateInto((float) fx, (float) fy, (float) fz, rotX, rotY, rotZ, rotW);
-        body.addImpulse(r[0], r[1], r[2]);
+        Vector3f r = this.rotateInto((float) fx, (float) fy, (float) fz, rotX, rotY, rotZ, rotW);
+        body.addImpulse(r.x, r.y, r.z);
         r = this.rotateInto((float) tx, (float) ty, (float) tz, rotX, rotY, rotZ, rotW);
-        body.addAngularImpulse(r[0], r[1], r[2]);
+        body.addAngularImpulse(r.x, r.y, r.z);
         sb.snapGen = 0; // impulse changed the velocity
         if (wakeUp) {
             this.bi.activateBody(sb.joltId);
@@ -883,7 +1007,7 @@ public final class JoltPhysicsScene {
      * Scratch buffer for {@link #rotateInto}; ThreadLocal because callers run
      * both on the server thread and on buoyancy/Jolt job threads.
      */
-    private final ThreadLocal<float[]> rotateOut = ThreadLocal.withInitial(() -> new float[3]);
+    private final ThreadLocal<Vector3f> rotateOut = ThreadLocal.withInitial(Vector3f::new);
     private final ThreadLocal<Quat> tmpQuat = ThreadLocal.withInitial(Quat::new);
     private final ThreadLocal<RVec3> tmpCom = ThreadLocal.withInitial(RVec3::new);
     private final ThreadLocal<RVec3> tmpPoint = ThreadLocal.withInitial(RVec3::new);
@@ -894,17 +1018,17 @@ public final class JoltPhysicsScene {
      * scratch buffer (allocation-free). The result is valid only until the next
      * call on the same thread — copy the components out before rotating again.
      */
-    private float[] rotateInto(final float vx, final float vy, final float vz,
-                               final float qx, final float qy, final float qz, final float qw) {
+    private Vector3f rotateInto(final float vx, final float vy, final float vz,
+                                final float qx, final float qy, final float qz, final float qw) {
         // t = 2 * cross(q.xyz, v)
         final float tx = 2.0f * (qy * vz - qz * vy);
         final float ty = 2.0f * (qz * vx - qx * vz);
         final float tz = 2.0f * (qx * vy - qy * vx);
         // v + w*t + cross(q.xyz, t)
-        final float[] out = this.rotateOut.get();
-        out[0] = vx + qw * tx + (qy * tz - qz * ty);
-        out[1] = vy + qw * ty + (qz * tx - qx * tz);
-        out[2] = vz + qw * tz + (qx * ty - qy * tx);
+        final Vector3f out = this.rotateOut.get();
+        out.x = vx + qw * tx + (qy * tz - qz * ty);
+        out.y = vy + qw * ty + (qz * tx - qx * tz);
+        out.z = vz + qw * tz + (qx * ty - qy * tx);
         return out;
     }
 
@@ -920,9 +1044,9 @@ public final class JoltPhysicsScene {
         }
         final Quat rot = this.tmpQuat.get();
         sb.body.getRotation(rot);
-        final float[] r = this.rotateInto((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z),
+        final Vector3f r = this.rotateInto((float) (x - sb.centerOfMass.x), (float) (y - sb.centerOfMass.y), (float) (z - sb.centerOfMass.z),
                 -rot.getX(), -rot.getY(), -rot.getZ(), rot.getW());
-        return new RVec3(r[0], r[1], r[2]);
+        return new RVec3(r.x, r.y, r.z);
     }
 
     //endregion
@@ -1013,7 +1137,7 @@ public final class JoltPhysicsScene {
             }
         }
         final long[] keys = sectionKeys.toLongArray();
-        java.util.Arrays.sort(keys);
+        Arrays.sort(keys);
 
         int sectionOrdinal = 0;
         int sectionsBuilt = 0;
@@ -1029,17 +1153,17 @@ public final class JoltPhysicsScene {
                 // Section COM (com-relative space): Jolt rebases section children onto
                 // the section center of mass when the static compound is created, so
                 // the section must be placed at exactly that offset inside the parent.
-                final Object[] sectionBuild = this.appendSectionBlocks(sb, sectionSettings, sectionChildren,
+                final SectionBlocks sectionBuild = this.appendSectionBlocks(sb, sectionSettings, sectionChildren,
                         unpackChunkX(key), unpackChunkY(key), unpackChunkZ(key), data,
                         sb.kind == SableBody.Kind.CONTRAPTION);
                 if (sectionBuild == null) {
                     // empty section (all air / no leaf boxes) — not an error
                     continue;
                 }
-                final double[] sectionCom = (double[]) sectionBuild[0];
-                final Vec3 singleOffset = (Vec3) sectionBuild[1];
+                final double[] sectionCom = sectionBuild.array;
+                final Vec3 singleOffset = sectionBuild.offset;
                 final ConstShape singleLeaf =
-                        (ConstShape) sectionBuild[2];
+                        sectionBuild.shape;
                 if (sectionChildren.isEmpty()) {
                     continue;
                 }
@@ -1134,6 +1258,18 @@ public final class JoltPhysicsScene {
         }
     }
 
+    public class SectionBlocks {
+        public double @Nullable [] array;
+        public @Nullable Vec3 offset;
+        public @Nullable ConstShape shape;
+
+        public SectionBlocks(double @Nullable [] array, @Nullable Vec3 offset, @Nullable ConstShape shape) {
+            this.array = array;
+            this.offset = offset;
+            this.shape = shape;
+        }
+    }
+
     /**
      * Builds one section's leaf boxes into {@code settings} and returns:
      * [0] the section's volume-weighted center of mass in the body-COM-relative
@@ -1145,9 +1281,9 @@ public final class JoltPhysicsScene {
      * {@code null} when nothing was added.
      */
     @Nullable
-    private Object[] appendSectionBlocks(final SableBody sb, final StaticCompoundShapeSettings settings, final List<Child> outChildren,
-                                         final int cx, final int cy, final int cz,
-                                         final ChunkSectionData data, final boolean ignoreBounds) {
+    private SectionBlocks appendSectionBlocks(final SableBody sb, final StaticCompoundShapeSettings settings, final List<Child> outChildren,
+                                              final int cx, final int cy, final int cz,
+                                              final ChunkSectionData data, final boolean ignoreBounds) {
         final int blockMinX = cx << 4;
         final int blockMinY = cy << 4;
         final int blockMinZ = cz << 4;
@@ -1250,22 +1386,35 @@ public final class JoltPhysicsScene {
         comY /= volSum;
         comZ /= volSum;
 
+
+        final Vec3 mutableVec3 = new Vec3(comX, comY, comZ);
         // Second pass: emit boxes rebased onto the section COM.
         for (int i = 0; i < offsets.size(); i++) {
-            settings.addShape(new Vec3(
+            mutableVec3.set(
                     (float) (offsets.get(i).getX() - comX),
                     (float) (offsets.get(i).getY() - comY),
-                    (float) (offsets.get(i).getZ() - comZ)), Quat.sIdentity(), shapes.get(i));
+                    (float) (offsets.get(i).getZ() - comZ)
+            );
+            settings.addShape(
+                    mutableVec3,
+                    Quat.sIdentity(),
+                    shapes.get(i)
+            );
         }
         final double[] com = new double[]{comX, comY, comZ};
         if (offsets.size() == 1) {
-            return new Object[]{com,
-                    new Vec3((float) (offsets.get(0).getX() - comX),
-                            (float) (offsets.get(0).getY() - comY),
-                            (float) (offsets.get(0).getZ() - comZ)),
-                    shapes.get(0)};
+
+            mutableVec3.set(
+                    (float) (offsets.get(0).getX() - comX),
+                    (float) (offsets.get(0).getY() - comY),
+                    (float) (offsets.get(0).getZ() - comZ)
+            );
+            return new SectionBlocks(com,
+                    mutableVec3,
+                    shapes.get(0)
+            );
         }
-        return new Object[]{com, null, null};
+        return new SectionBlocks(com, null, null);
     }
 
     private static String appendReject(final String log, final int x, final int y, final int z, final String reason) {
@@ -1355,6 +1504,15 @@ public final class JoltPhysicsScene {
     }
 
     private void flushDirty() {
+        this.flushCreativeRestore();
+        if (!this.creativeDragBodies.isEmpty()) {
+            for (final int joltId : this.creativeDragBodies) {
+                final SableBody sb = this.bodyByJoltId(joltId);
+                if (sb != null) {
+                    sb.dragPenDepth = 0.0;
+                }
+            }
+        }
         if (!this.dirtyBodies.isEmpty()) {
             final ObjectArrayList<SableBody> list;
             synchronized (this.dirtyBodies) {
@@ -1450,6 +1608,8 @@ public final class JoltPhysicsScene {
      * so bodies glide across block seams like on the Rapier reference.
      */
     private void buildGlobalChunkShape(final GlobalChunk chunk) {
+        final Vec3 mutableVec3 = new Vec3();
+        final Quat identityQuat = Quat.sIdentity();
         final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
         chunk.children.clear();
         chunk.childById.clear();
@@ -1540,12 +1700,17 @@ public final class JoltPhysicsScene {
                     final float sz = (z1 - bz + 1) * 0.5f;
 
                     final BoxShape slabShape = this.sharedBoxShape(sx, 0.5f, sz);
-                    final Vec3 mutable = new Vec3(
+
+                    mutableVec3.set(
                             baseX + bx + sx,
                             baseY + by + 0.5f,
                             baseZ + bz + sz
                     );
-                    settings.addShape(mutable, Quat.sIdentity(), slabShape);
+                    settings.addShape(
+                            mutableVec3,
+                            identityQuat,
+                            slabShape
+                    );
                     chunk.children.add(new Child(baseX + bx, baseY + by, baseZ + bz, id));
                 }
             }
@@ -1571,11 +1736,16 @@ public final class JoltPhysicsScene {
 
                     for (int i = 0; i < size; i++) {
                         final JoltVoxelColliderData.VoxelBox box = (JoltVoxelColliderData.VoxelBox) elements[i];
-                        settings.addShape(new Vec3(
+                        mutableVec3.set(
                                 (float) (baseX + bx + ((box.minX + box.maxX) * 0.5)),
                                 (float) (baseY + by + ((box.minY + box.maxY) * 0.5)),
-                                (float) (baseZ + bz + ((box.minZ + box.maxZ) * 0.5))),
-                                Quat.sIdentity(), entry.shape(i));
+                                (float) (baseZ + bz + ((box.minZ + box.maxZ) * 0.5))
+                        );
+                        settings.addShape(
+                                mutableVec3,
+                                identityQuat,
+                                entry.shape(i)
+                        );
                         chunk.children.add(new Child(baseX + bx, baseY + by, baseZ + bz, id));
                     }
                 }
@@ -1634,7 +1804,11 @@ public final class JoltPhysicsScene {
         }
 
         if (chunk.joltId == 0) {
-            final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape, RVec3.sZero(), Quat.sIdentity(), EMotionType.Static, LAYER_STATIC);
+            final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape,
+                    0, 0, 0, 0, 0, 0, 1,
+                    EMotionType.Static,
+                    LAYER_STATIC
+            );
             final Body body = this.bi.createBody(bcs);
             body.setUserData(-1L);
             this.bi.addBody(body, EActivation.DontActivate);
@@ -1700,7 +1874,7 @@ public final class JoltPhysicsScene {
             mount.groupSubId = 0;
             groupId = this.nextGroupId.getAndIncrement();
             this.mountGroupIds.put(mount.runtimeId, groupId);
-        final Body mountBody = mount.body;
+            final Body mountBody = mount.body;
             mountBody.setCollisionGroup(new CollisionGroup(this.mountFilterRef, groupId, 0));
         }
 
@@ -1723,25 +1897,19 @@ public final class JoltPhysicsScene {
         body.setCollisionGroup(new CollisionGroup(this.mountFilterRef, groupId, sub));
     }
 
-    private final it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap mountGroupIds = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+    private final Int2IntOpenHashMap mountGroupIds = new Int2IntOpenHashMap();
 
     /**
      * Section keys of global chunks that contain at least one fluid block; buoyancy
      * is skipped entirely when empty.
      */
-    private final it.unimi.dsi.fastutil.longs.LongOpenHashSet fluidSections = new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
+    private final LongOpenHashSet fluidSections = new LongOpenHashSet();
 
     /**
      * Bumped whenever any chunk section data changes; used to invalidate the
      * per-body shape rebuild dedup.
      */
     private long chunkDataVersion;
-
-    /**
-     * Reusable jolt-jni wrappers for the per-substep hot paths (server thread only):
-     * avoids native allocations and cleaner churn.
-     */
-    private JobSystem activeJobSystem;
 
     public void removeKinematicContraption(final int id) {
         final SableBody sb = this.bodies.get(id);
@@ -1812,12 +1980,16 @@ public final class JoltPhysicsScene {
         // tuned for small scenes. A huge compound body resting on the ground forms a
         // contact island with thousands of points; halving the iteration depth there
         // roughly halves the solver cost with no visible stability change.
-        if (heavyBody != this.reducedSolverApplied) {
+        // Exception: while a creative drag is active the full depth is kept —
+        // depenetration quality matters more than step cost when the wand
+        // grinds a huge body against the terrain.
+        final boolean reducedSolver = heavyBody && this.creativeDragBodies.isEmpty();
+        if (reducedSolver != this.reducedSolverApplied) {
             final PhysicsSettings physics = this.system.getPhysicsSettings();
-            physics.setNumVelocitySteps(heavyBody ? 5 : 10);
-            physics.setNumPositionSteps(heavyBody ? 2 : 4);
+            physics.setNumVelocitySteps(reducedSolver ? 5 : 10);
+            physics.setNumPositionSteps(reducedSolver ? 2 : 4);
             this.system.setPhysicsSettings(physics);
-            this.reducedSolverApplied = heavyBody;
+            this.reducedSolverApplied = reducedSolver;
         }
 
         this.system.update((float) timeStep, 1, this.tempAllocator, jobs);
@@ -1851,14 +2023,52 @@ public final class JoltPhysicsScene {
         // budget, put oversized bodies to sleep so the world can recover instead
         // of freezing every subsequent tick.
         final long updateNanos = System.nanoTime() - stepStartNanos;
-        if (updateNanos > 250_000_000L) {            for (final SableBody sb : this.bodies.values()) {
-                if (sb.children.size() >= HEAVY_BODY_CHILDREN && sb.body.isActive()) {
+        if (updateNanos > 250_000_000L) {
+            for (final SableBody sb : this.bodies.values()) {
+                if (sb.children.size() >= HEAVY_BODY_CHILDREN && sb.body.isActive()
+                        && !this.creativeDragBodies.contains(sb.joltId)) {
                     this.bi.activateBody(sb.joltId); // refresh internal bounds bookkeeping
                     if (sb.body.getLinearVelocity().lengthSq() < 0.5f) {
                         this.bi.deactivateBody(sb.joltId);
                     }
                 }
             }
+        }
+        this.pushDraggedOutOfPenetration();
+    }
+
+    /**
+     * Allowed embed depth (m) of a dragged body before the push-out engages;
+     * contact slop below this is normal solver behavior.
+     */
+    private static final double DRAG_PUSH_SLOP = 0.12;
+    /**
+     * Max push-out distance (m) per step for a dragged body.
+     */
+    private static final double DRAG_PUSH_MAX = 1.5;
+
+    /**
+     * Nudges creatively dragged bodies out of deep penetration. Rotating or
+     * dragging a huge body can sweep its parts meters into the terrain within
+     * a single tick — faster than the solver's per-step recovery — which would
+     * otherwise ratchet the body underground. The snapshot fields are updated
+     * together with the body so later reads stay consistent.
+     */
+    private void pushDraggedOutOfPenetration() {
+        if (this.creativeDragBodies.isEmpty()) {
+            return;
+        }
+        for (final int joltId : this.creativeDragBodies) {
+            final SableBody sb = this.bodyByJoltId(joltId);
+            if (sb == null || sb.dragPenDepth <= DRAG_PUSH_SLOP) {
+                continue;
+            }
+            final double push = Math.min(sb.dragPenDepth - DRAG_PUSH_SLOP, DRAG_PUSH_MAX);
+            sb.snapX += sb.dragPenNx * push;
+            sb.snapY += sb.dragPenNy * push;
+            sb.snapZ += sb.dragPenNz * push;
+            this.bi.setPositionAndRotation(joltId, sb.snapX, sb.snapY, sb.snapZ,
+                    sb.snapQx, sb.snapQy, sb.snapQz, sb.snapQw, EActivation.DontActivate);
         }
     }
 
@@ -1956,14 +2166,14 @@ public final class JoltPhysicsScene {
         // actually submitted; otherwise an empty trailing slice would leave the
         // caller waiting on counts that never happen (permanent server stall).
         final int sliceSize = (bodies.size() + workers - 1) / workers;
-        final java.util.List<int[]> slices = new java.util.ArrayList<>(workers - 1);
+        final ObjectArrayList<Vector2i> slices = new ObjectArrayList<>(workers - 1);
         for (int w = 1; w < workers; w++) {
             final int from = w * sliceSize;
             final int to = Math.min(bodies.size(), from + sliceSize);
             if (from >= to) {
                 break;
             }
-            slices.add(new int[]{from, to});
+            slices.add(new Vector2i(from, to));
         }
         if (slices.isEmpty()) {
             for (final SableBody sb : bodies) {
@@ -1972,9 +2182,9 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(slices.size());
-        for (final int[] slice : slices) {
-            final List<SableBody> part = bodies.subList(slice[0], slice[1]);
+        final CountDownLatch latch = new CountDownLatch(slices.size());
+        for (final Vector2i slice : slices) {
+            final List<SableBody> part = bodies.subList(slice.x, slice.y);
             this.bodyWorkers.submit(() -> {
                 try {
                     for (final SableBody sb : part) {
@@ -2046,6 +2256,8 @@ public final class JoltPhysicsScene {
         this.fluidSections.clear();
         this.angularFollowPrev.clear();
         this.angularCachedOmega.clear();
+        this.creativeDragBodies.clear();
+        this.creativeRestorePending.clear();
         this.ropePointBodies.clear();
         this.mountGroupIds.clear();
     }
@@ -2063,7 +2275,7 @@ public final class JoltPhysicsScene {
             return;
         }
 
-        final ArrayList<SableBody> active = new ArrayList<>();
+        final ObjectArrayList<SableBody> active = new ObjectArrayList<>();
         for (final SableBody sb : this.bodies.values()) {
             if (sb.kind == SableBody.Kind.SUB_LEVEL && sb.hasBounds && !sb.children.isEmpty()) {
                 final Body body = sb.body;
@@ -2079,13 +2291,19 @@ public final class JoltPhysicsScene {
         if (active.size() >= 12) {
             this.runParallel(active, this::buoyancyForBody);
         } else {
-            for (final SableBody sb : active) {
+            final Object[] elements = active.elements();
+            for (int i = 0; i < active.size(); i++) {
+                final SableBody sb = (SableBody) elements[i];
                 this.buoyancyForBody(sb);
             }
         }
     }
 
     private void buoyancyForBody(final SableBody sb) {
+        // Creative-dragged bodies ignore fluid forces.
+        if (this.creativeDragBodies.contains(sb.joltId)) {
+            return;
+        }
         final Body body = sb.body;
 
         // Reads come from the batch snapshot when fresh (one tick stale is
@@ -2131,12 +2349,12 @@ public final class JoltPhysicsScene {
 
         // Rotated unit axes give the world-space Y extent of every child cube:
         // an extent that stays correct (and smooth) for any body orientation.
-        float[] r = this.rotateInto(1.0f, 0.0f, 0.0f, qx, qy, qz, qw);
-        final double xAxY = r[1];
+        Vector3f r = this.rotateInto(1.0f, 0.0f, 0.0f, qx, qy, qz, qw);
+        final double xAxY = r.y;
         r = this.rotateInto(0.0f, 1.0f, 0.0f, qx, qy, qz, qw);
-        final double yAxY = r[1];
+        final double yAxY = r.y;
         r = this.rotateInto(0.0f, 0.0f, 1.0f, qx, qy, qz, qw);
-        final double halfY = 0.5 * (Math.abs(xAxY) + Math.abs(yAxY) + Math.abs(r[1]));
+        final double halfY = 0.5 * (Math.abs(xAxY) + Math.abs(yAxY) + Math.abs(r.y));
 
         // Accumulated submerged volume and its centroid: the float force is applied
         // at the centroid of the submerged part, so a tilted body gets a smooth
@@ -2160,9 +2378,9 @@ public final class JoltPhysicsScene {
             final double lpz = c.bz + 0.5 - sb.centerOfMass.z;
 
             r = this.rotateInto((float) lpx, (float) lpy, (float) lpz, qx, qy, qz, qw);
-            final double wx = comX + r[0];
-            final double wy = comY + r[1];
-            final double wz = comZ + r[2];
+            final double wx = comX + r.x;
+            final double wy = comY + r.y;
+            final double wz = comZ + r.z;
 
             final int wbx = floor(wx);
             final int wby = floor(wy);
@@ -2319,7 +2537,9 @@ public final class JoltPhysicsScene {
      * Each collision is formatted as:
      * [body_a, body_b, force_amount, local_normal_a, local_normal_b, local_point_a, local_point_b]
      */
-    /** Reused output buffer of {@link #clearCollisions} (server thread only). */
+    /**
+     * Reused output buffer of {@link #clearCollisions} (server thread only).
+     */
     private final double[] collisionOut = new double[100 * 15];
     private int collisionCount;
 
@@ -2340,7 +2560,9 @@ public final class JoltPhysicsScene {
         return this.collisionOut;
     }
 
-    /** Number of valid 15-double records in the last {@link #clearCollisions} result. */
+    /**
+     * Number of valid 15-double records in the last {@link #clearCollisions} result.
+     */
     public int lastCollisionCount() {
         return this.collisionCount;
     }
@@ -2687,6 +2909,16 @@ public final class JoltPhysicsScene {
                 return;
             }
 
+            // Deepest-penetration tracking for creatively dragged bodies: the
+            // end-of-step push-out keeps the wand from grinding them into the
+            // terrain faster than the solver can recover.
+            if (sb1 != null && JoltPhysicsScene.this.creativeDragBodies.contains(sb1.joltId)) {
+                this.accumulateDragPenetration(sb1, body1, manifold, true);
+            }
+            if (sb2 != null && JoltPhysicsScene.this.creativeDragBodies.contains(sb2.joltId)) {
+                this.accumulateDragPenetration(sb2, body2, manifold, false);
+            }
+
             final int subShape1 = manifold.getSubShapeId1();
             final int subShape2 = manifold.getSubShapeId2();
 
@@ -2734,6 +2966,40 @@ public final class JoltPhysicsScene {
             return chunk.childById.get(subShapeId);
         }
 
+        /**
+         * Records the deepest contact penetration of a dragged body this step.
+         * The manifold normal moves body 2 out of collision, so it is flipped
+         * for body 1; the result is additionally verified against the
+         * contact-to-COM direction so a wrong convention can never push the
+         * body deeper.
+         */
+        private void accumulateDragPenetration(final SableBody dragged, final Body self,
+                                               final ContactManifold manifold, final boolean isFirst) {
+            final float depth = manifold.getPenetrationDepth();
+            if (depth <= 0.0f || depth <= dragged.dragPenDepth) {
+                return;
+            }
+            final Vec3 n = manifold.getWorldSpaceNormal();
+            double nx = n.getX(), ny = n.getY(), nz = n.getZ();
+            if (isFirst) {
+                nx = -nx;
+                ny = -ny;
+                nz = -nz;
+            }
+            final RVec3 com = self.getCenterOfMassPosition();
+            final RVec3 base = manifold.getBaseOffset();
+            final double ox = com.xx() - base.xx(), oy = com.yy() - base.yy(), oz = com.zz() - base.zz();
+            if (nx * ox + ny * oy + nz * oz < 0.0) {
+                nx = -nx;
+                ny = -ny;
+                nz = -nz;
+            }
+            dragged.dragPenDepth = depth;
+            dragged.dragPenNx = nx;
+            dragged.dragPenNy = ny;
+            dragged.dragPenNz = nz;
+        }
+
         private void invokeCallback(final JoltVoxelColliderData entry, final Child c, final Child other,
                                     final Body body, final ContactManifold manifold, final ContactSettings settings,
                                     final boolean isFirst) {
@@ -2753,12 +3019,12 @@ public final class JoltPhysicsScene {
                 }
                 final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
                 body.getRotation(rot);
-                final float[] r = JoltPhysicsScene.this.rotateInto(
+                final Vector3f r = JoltPhysicsScene.this.rotateInto(
                         (float) result[0], (float) result[1], (float) result[2],
                         rot.getX(), rot.getY(), rot.getZ(), rot.getW());
-                tanX = r[0];
-                tanY = r[1];
-                tanZ = r[2];
+                tanX = r.x;
+                tanY = r.y;
+                tanZ = r.z;
                 final boolean remove = result[3] > 0.0;
                 if (remove) {
                     settings.setIsSensor(true);
@@ -2784,10 +3050,10 @@ public final class JoltPhysicsScene {
             final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
             body.getRotation(rot);
             final float qx = rot.getX(), qy = rot.getY(), qz = rot.getZ(), qw = rot.getW();
-            float[] r = JoltPhysicsScene.this.rotateInto((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z, qx, qy, qz, qw);
-            final float linX = r[0], linY = r[1], linZ = r[2];
+            Vector3f r = JoltPhysicsScene.this.rotateInto((float) sb.linVel.x, (float) sb.linVel.y, (float) sb.linVel.z, qx, qy, qz, qw);
+            final float linX = r.x, linY = r.y, linZ = r.z;
             r = JoltPhysicsScene.this.rotateInto((float) sb.angVel.x, (float) sb.angVel.y, (float) sb.angVel.z, qx, qy, qz, qw);
-            final float angX = r[0], angY = r[1], angZ = r[2];
+            final float angX = r.x, angY = r.y, angZ = r.z;
 
             // approximate surface velocity at the body center; direction relative to body 1 / 2
             final float sign = isFirst ? -1.0f : 1.0f;
@@ -2809,6 +3075,11 @@ public final class JoltPhysicsScene {
         private void report(final SableBody sb1, final SableBody sb2, final Child c1, final Child c2,
                             final JoltVoxelColliderData entry1, final JoltVoxelColliderData entry2,
                             final Body body1, final Body body2, final ContactManifold manifold) {
+            // No collision damage while god-dragging.
+            if ((sb1 != null && JoltPhysicsScene.this.creativeDragBodies.contains(sb1.joltId))
+                    || (sb2 != null && JoltPhysicsScene.this.creativeDragBodies.contains(sb2.joltId))) {
+                return;
+            }
             final int id1 = sb1 != null ? sb1.runtimeId : -1;
             final int id2 = sb2 != null ? sb2.runtimeId : -1;
 
@@ -2858,11 +3129,11 @@ public final class JoltPhysicsScene {
             final Quat rot = JoltPhysicsScene.this.tmpQuat.get();
             body1.getRotation(rot);
             final float r1qx = rot.getX(), r1qy = rot.getY(), r1qz = rot.getZ(), r1qw = rot.getW();
-            float[] wr = JoltPhysicsScene.this.rotateInto((float) px1, (float) py1, (float) pz1, r1qx, r1qy, r1qz, r1qw);
-            final double wp1x = wr[0], wp1y = wr[1], wp1z = wr[2];
+            Vector3f wr = JoltPhysicsScene.this.rotateInto((float) px1, (float) py1, (float) pz1, r1qx, r1qy, r1qz, r1qw);
+            final double wp1x = wr.x, wp1y = wr.y, wp1z = wr.z;
             body2.getRotation(rot);
             wr = JoltPhysicsScene.this.rotateInto((float) px2, (float) py2, (float) pz2, rot.getX(), rot.getY(), rot.getZ(), rot.getW());
-            final double wp2x = wr[0], wp2y = wr[1], wp2z = wr[2];
+            final double wp2x = wr.x, wp2y = wr.y, wp2z = wr.z;
 
             final double p1x = com1x + wp1x, p1y = com1y + wp1y, p1z = com1z + wp1z;
             final double p2x = com2x + wp2x, p2y = com2y + wp2y, p2z = com2z + wp2z;

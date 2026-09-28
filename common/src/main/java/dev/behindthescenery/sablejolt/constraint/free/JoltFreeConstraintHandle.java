@@ -93,8 +93,13 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         settings.setPosition2(new RVec3((float) p2x, (float) p2y, (float) p2z));
 
         final var q = config.orientation();
-        settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisX()));
-        settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) q.x(), (float) q.y(), (float) q.z(), (float) q.w(), Vec3.sAxisY()));
+        // NOTE: do NOT compose this with the sub-level's live orientation —
+        // logicalPose tracks the body itself, so the servo target would move
+        // with the body (positive feedback → perpetual self-spin). The gun
+        // orientation is used as-is; it is stable across ticks.
+        final Quaterniond frameQ = new Quaterniond(q.x(), q.y(), q.z(), q.w());
+        settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) frameQ.x, (float) frameQ.y, (float) frameQ.z, (float) frameQ.w, Vec3.sAxisX()));
+        settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) frameQ.x, (float) frameQ.y, (float) frameQ.z, (float) frameQ.w, Vec3.sAxisY()));
 
         for (final EAxis axis : EAxis.values()) {
             if (axis == EAxis.Num) {
@@ -122,7 +127,7 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
 
         final JoltFreeConstraintHandle handle = new JoltFreeConstraintHandle(scene, id);
         handle.settings = settings;
-        handle.frameQuat.set(q.x(), q.y(), q.z(), q.w());
+        handle.frameQuat.set(frameQ);
         handle.renderFrameServo = renderFrameServo;
         if (!renderFrameServo) {
             handle.targetWorld.set(config.pos1().x(), config.pos1().y(), config.pos1().z());
@@ -158,14 +163,14 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         } catch (final Throwable ignored) {
             // never block removal on diagnostics
         }
-        // End of a kinematic drag (or a per-tick recreation — the restore is
+        // End of a creative drag (or a per-tick recreation — the restore is
         // deferred to the next step start, so recreation is harmless).
         try {
             if (record == null) {
                 record = this.record();
             }
             if (record != null) {
-                this.scene.endKinematicDrag(record.joltIdB);
+                this.scene.endCreativeDrag(record.joltIdB);
             }
         } catch (final Throwable ignored) {
             // never block removal on bookkeeping
@@ -181,10 +186,10 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         }
 
         this.motors[axisOrdinal] = new SixDofMotors.MotorParams(target, stiffness, damping, hasForceLimit, maxForce);
-        // Creative grip (no force limit = physics staff): the body goes
-        // kinematic and follows the wand exactly, ignoring gravity and weight.
+        // Creative grip (no force limit = physics staff): gravity is switched
+        // off for the body while held, so weight can neither pull nor tip it.
         if (!hasForceLimit && axisOrdinal < 3) {
-            this.scene.beginKinematicDrag(record.joltIdB);
+            this.scene.beginCreativeDrag(record.joltIdB);
         }
         SixDofMotors.applyMotorFree(constraint, this.settings, axisOrdinal, this.motors, this.scene,
                 record.joltIdA, record.joltIdB, this.frameQuat, this.targetWorld, this.renderFrameServo, this.subLevel);

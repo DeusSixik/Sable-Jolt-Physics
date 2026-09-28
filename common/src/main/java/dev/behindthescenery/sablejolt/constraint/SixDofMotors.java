@@ -7,6 +7,7 @@ import com.github.stephengold.joltjni.Quat;
 import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.SixDofConstraint;
 import com.github.stephengold.joltjni.Vec3;
+import com.github.stephengold.joltjni.enumerate.EActivation;
 import com.github.stephengold.joltjni.enumerate.EAxis;
 import com.github.stephengold.joltjni.enumerate.EMotorState;
 import dev.behindthescenery.sablejolt.JoltDebugLogging;
@@ -50,6 +51,36 @@ public final class SixDofMotors {
     private static final double MAX_ANGULAR_SPEED = 6.0;
     private static final double MAX_ANGULAR_TOTAL_SPEED = 8.0;
     private static final double MAX_LINEAR_GAIN = 8.0;
+    /**
+     * Max acceleration (m/s^2) of the creative linear drive, scaled by mass.
+     * Free-space tracking stays exact (it needs only a few m/s^2), but the
+     * drive now yields to terrain contacts instead of embedding the body —
+     * an uncapped servo always wins against the solver.
+     */
+    private static final double CREATIVE_MAX_ACCEL = 40.0;
+    /**
+     * Tip-speed limit (m/s) of creative rotation: the same rad/s looks r times
+     * faster on a huge body, so the angular cap is derived from the edge speed
+     * instead. Estimated radius comes from inertia (r = sqrt(3*I/m)).
+     */
+    private static final double TIP_SPEED_MAX = 5.0;
+    /**
+     * Max orientation step (rad/tick) of the creative snap for small bodies;
+     * huge bodies are additionally limited by {@link #SNAP_TIP_SPEED}.
+     */
+    private static final double SNAP_MAX_STEP = 0.15;
+    /**
+     * Bodies with an estimated radius below this (m) snap instantly — no lag,
+     * no catching up. Above it the tip-speed limit applies, otherwise a huge
+     * body would sweep its ends through the terrain on grab.
+     */
+    private static final double SNAP_INSTANT_RADIUS = 8.0;
+    /**
+     * Edge-speed limit (m/s) of the creative orientation snap: snapping a huge
+     * body across its full error in one tick would sweep its ends through the
+     * terrain.
+     */
+    private static final double SNAP_TIP_SPEED = 12.0;
 
     /**
      * Sable physics tick rate.
@@ -230,11 +261,6 @@ public final class SixDofMotors {
         final Body b1 = constraint.getBody1();
         final Body b2 = constraint.getBody2();
 
-        // Creative grip: the body was switched to Kinematic on grab and follows
-        // the wand exactly (no gravity, no tip-over). Driven with moveKinematic
-        // instead of forces.
-        final boolean creative = scene != null && scene.isKinematicDrag(joltIdB);
-
         // LINEAR: drive the body with a direct force instead of Jolt velocity
         // motors. Motor commands were measured to translate into ~1% of the
         // commanded velocity on this scene, while addForce (used everywhere else
@@ -302,21 +328,15 @@ public final class SixDofMotors {
                 dvz = 0.0;
             }
 
-            if (creative) {
-                // Kinematic position follow: advance the center of mass by the
-                // desired velocity step (dv is already clamped to
-                // MAX_LINEAR_SPEED). Jolt derives the body velocity from the
-                // delta, so release throws naturally.
-                scene.getBodyInterface().moveKinematic(joltIdB,
-                        new RVec3(com2.xx() + dvx * DT, com2.yy() + dvy * DT, com2.zz() + dvz * DT),
-                        r2, (float) DT);
-                return;
-            }
-
             // F = m * (vDesired - vBody) / dt. The caller's force limit (Simulated's
             // handleMaxForce) is respected: heavy objects cannot be lifted, light
-            // ones are dragged briskly. The force is applied AT the grabbed point
-            // so dragging produces realistic tilt torque on the body.
+            // ones are dragged briskly. Force-limited handles apply the force AT
+            // the grabbed point so dragging produces realistic tilt torque.
+            // The creative grip instead applies it at the center of mass: with
+            // uncapped forces an off-center application feeds rotation back into
+            // the position error (anchor swings around the COM) — a self-spin
+            // and slingshot loop. Orientation is driven solely by the angular
+            // servo, so the body glides without induced spin.
             final Vec3 vel = b2.getLinearVelocity();
             double fx = mass * (dvx - vel.getX()) / DT;
             double fy = mass * (dvy - vel.getY()) / DT;
@@ -327,9 +347,21 @@ public final class SixDofMotors {
                 fx *= scale;
                 fy *= scale;
                 fz *= scale;
+            } else if (!params.hasForceLimit()) {
+                final double cap = mass * CREATIVE_MAX_ACCEL;
+                if (fLen > cap) {
+                    final double scale = cap / fLen;
+                    fx *= scale;
+                    fy *= scale;
+                    fz *= scale;
+                }
             }
             if (isFinite(fx) && isFinite(fy) && isFinite(fz)) {
-                b2.addForce(new Vec3((float) fx, (float) fy, (float) fz), new RVec3((float) axW, (float) ayW, (float) azW));
+                if (params.hasForceLimit()) {
+                    b2.addForce(new Vec3((float) fx, (float) fy, (float) fz), new RVec3((float) axW, (float) ayW, (float) azW));
+                } else {
+                    b2.addForce((float) fx, (float) fy, (float) fz, com2.xx(), com2.yy(), com2.zz());
+                }
             }
 
             // Jolt never wakes bodies for out-of-band forces; the tools expect
@@ -357,12 +389,13 @@ public final class SixDofMotors {
         double wx = 0.0;
         double wy = 0.0;
         double wz = 0.0;
-        // Same mass-independent response for the unlimited (creative) grip as
-        // for the linear axes; the torque cap below stays an angular-acceleration
-        // cap, which is already mass-independent.
+        // Legacy mass-based gain for force-limited handles (iron handle
+        // feel); the creative grip gets an inertia-scaled response below,
+        // once the world inertia is known.
         final double gain = params.hasForceLimit()
                 ? servoGain(params.stiffness(), effectiveMass(constraint))
                 : MAX_LINEAR_GAIN;
+        final float angMass = effectiveMass(constraint);
         {
 
             final Quat jointLocal = jointFrameQuatLocal == null ? Quat.sIdentity()
@@ -377,12 +410,17 @@ public final class SixDofMotors {
 
             final Quaterniond bodyNow = new Quaterniond(b2.getRotation().getX(), b2.getRotation().getY(), b2.getRotation().getZ(), b2.getRotation().getW());
 
-            if (creative) {
-                // Kinematic orientation follow, applied once (axis 3 carries the
-                // fresh angular targets; 4 and 5 reuse the same tick's result).
-                // Normalized-lerp towards the desired orientation, clamped to
-                // MAX_ANGULAR_SPEED per tick.
-                if (axisOrdinal == 3) {
+            if (!params.hasForceLimit()) {
+                // Creative grip: drive the orientation directly towards the
+                // target — no inertia, no angle deltas (fast spins cannot
+                // alias at the 0/360 wrap, the old jerk-on-fast-rotation bug).
+                // The step is rate-limited: instant for small errors, and
+                // capped by edge speed for huge bodies — snapping a 100 m
+                // building across its full error in one tick would sweep its
+                // ends through the terrain. Applied once, on the axis carrying
+                // the fresh angular targets. Angular velocity is zeroed so no
+                // spin accumulates or survives the release.
+                if (axisOrdinal == 3 && scene != null) {
                     double dx = desiredW.x, dy = desiredW.y, dz = desiredW.z, dw = desiredW.w;
                     double dot = bodyNow.x * dx + bodyNow.y * dy + bodyNow.z * dz + bodyNow.w * dw;
                     if (dot < 0.0) {
@@ -393,17 +431,52 @@ public final class SixDofMotors {
                         dot = -dot;
                     }
                     final double angle = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, dot)));
-                    final double alpha = angle > 1.0e-9 ? Math.min(1.0, (MAX_ANGULAR_SPEED * DT) / angle) : 1.0;
-                    final double qx = bodyNow.x + (dx - bodyNow.x) * alpha;
-                    final double qy = bodyNow.y + (dy - bodyNow.y) * alpha;
-                    final double qz = bodyNow.z + (dz - bodyNow.z) * alpha;
-                    final double qw = bodyNow.w + (dw - bodyNow.w) * alpha;
-                    final double inv = 1.0 / Math.sqrt(Math.max(1.0e-18, qx * qx + qy * qy + qz * qz + qw * qw));
-                    scene.getBodyInterface().moveKinematic(joltIdB, b2.getCenterOfMassPosition(),
-                            new Quat((float) (qx * inv), (float) (qy * inv), (float) (qz * inv), (float) (qw * inv)),
-                            (float) DT);
+                    if (angle > 1.0e-9) {
+                        worldInertiaDiagonal(b2, bodyNow, angMass);
+                        final float[] iwSnap = WORLD_INERTIA.get();
+                        final float iwSnapMax = Math.max(iwSnap[0], Math.max(iwSnap[1], iwSnap[2]));
+                        final double radius = Math.sqrt(3.0 * Math.max(iwSnapMax, 1.0e-9f) / Math.max(angMass, 1.0e-9f));
+                        // Instant below the threshold; eased by edge speed above.
+                        final double alpha;
+                        if (radius <= SNAP_INSTANT_RADIUS) {
+                            alpha = 1.0;
+                        } else {
+                            final double maxStep = Math.min(SNAP_MAX_STEP, SNAP_TIP_SPEED * DT / Math.max(radius, 1.0e-6));
+                            alpha = Math.min(1.0, maxStep / angle);
+                        }
+                        final double qx = bodyNow.x + (dx - bodyNow.x) * alpha;
+                        final double qy = bodyNow.y + (dy - bodyNow.y) * alpha;
+                        final double qz = bodyNow.z + (dz - bodyNow.z) * alpha;
+                        final double qw = bodyNow.w + (dw - bodyNow.w) * alpha;
+                        final double inv = 1.0 / Math.sqrt(Math.max(1.0e-18, qx * qx + qy * qy + qz * qz + qw * qw));
+                        final RVec3 com = b2.getCenterOfMassPosition();
+                        scene.getBodyInterface().setPositionAndRotation(joltIdB, com,
+                                new Quat((float) (qx * inv), (float) (qy * inv), (float) (qz * inv), (float) (qw * inv)),
+                                EActivation.Activate);
+                    }
+                    b2.setAngularVelocity(0.0f, 0.0f, 0.0f);
                 }
                 return;
+            }
+
+            // Inertia-scaled response: huge bodies turn slowly, small bodies
+            // briskly (Rapier-like). A single torque cap cannot do this — it
+            // starves the small while the huge plow through contacts — so the
+            // commanded speed itself scales with inertia, and the torque cap
+            // below stays generous.
+            worldInertiaDiagonal(b2, bodyNow, angMass);
+            final float[] iw = WORLD_INERTIA.get();
+            final float iwMax = Math.max(iw[0], Math.max(iw[1], iw[2]));
+            final double gainEff;
+            final double omegaCap;
+            if (params.hasForceLimit()) {
+                gainEff = gain;
+                omegaCap = MAX_ANGULAR_TOTAL_SPEED;
+            } else {
+                gainEff = Math.min(MAX_LINEAR_GAIN, Math.sqrt(params.stiffness() / Math.max(iwMax, 1.0e-9f)) + 1.0);
+                final double radius = Math.sqrt(3.0 * Math.max(iwMax, 1.0e-9f) / Math.max(angMass, 1.0e-9f));
+                omegaCap = Math.min(MAX_ANGULAR_TOTAL_SPEED,
+                        Math.min(gainEff * 2.0, TIP_SPEED_MAX / Math.max(radius, 1.0e-6)));
             }
 
             Vector3d omegaW = scene == null ? null : scene.getCachedAngularOmega(joltIdB);
@@ -426,15 +499,15 @@ public final class SixDofMotors {
                 if (errAngle > 1.0e-5) {
                     final double s = Math.sqrt(Math.max(0.0, 1.0 - errW.w * errW.w));
                     final double inv = 1.0 / s;
-                    final double w = Math.min(errAngle * gain, MAX_ANGULAR_SPEED);
+                    final double w = Math.min(errAngle * gainEff, MAX_ANGULAR_SPEED);
                     omegaW.x += errW.x * inv * w;
                     omegaW.y += errW.y * inv * w;
                     omegaW.z += errW.z * inv * w;
                 }
 
                 final double mag = Math.sqrt(omegaW.x * omegaW.x + omegaW.y * omegaW.y + omegaW.z * omegaW.z);
-                if (mag > MAX_ANGULAR_TOTAL_SPEED) {
-                    final double scale = MAX_ANGULAR_TOTAL_SPEED / mag;
+                if (mag > omegaCap) {
+                    final double scale = omegaCap / mag;
                     omegaW.x *= scale;
                     omegaW.y *= scale;
                     omegaW.z *= scale;
@@ -448,20 +521,24 @@ public final class SixDofMotors {
                 }
             }
 
-            // tau = I * (omegaDesired - omega) / dt with a scalar inertia
-            // approximation (I ~ mass for block-scale bodies), capped by the
-            // caller's limit so the handle cannot rigidly freeze the body.
+            // tau_i = I_i * (omegaDesired - omega)_i / dt with the per-axis
+            // world-space inertia computed above. A mass scalar cannot turn
+            // huge bodies at all (I exceeds m by L^2/12 — hundreds of times
+            // for buildings), and a max-diagonal scalar would overshoot on
+            // the thin axes.
             final Vec3 omega = b2.getAngularVelocity();
-            final float mass = effectiveMass(constraint);
-            double tx = mass * (omegaW.x - omega.getX()) / DT;
-            double ty = mass * (omegaW.y - omega.getY()) / DT;
-            double tz = mass * (omegaW.z - omega.getZ()) / DT;
-            // Cap the angular acceleration (~60 rad/s^2): unlimited torque snaps
-            // the body to the grabbed orientation on the first tick and leaves a
-            // violent residual spin on release.
-            double torqueCap = mass * 60.0;
-            if (params.hasForceLimit() && params.maxForce() > 0.0) {
-                torqueCap = Math.min(torqueCap, params.maxForce());
+            double tx = iw[0] * (omegaW.x - omega.getX()) / DT;
+            double ty = iw[1] * (omegaW.y - omega.getY()) / DT;
+            double tz = iw[2] * (omegaW.z - omega.getZ()) / DT;
+            // Torque cap: generous for the creative grip (the commanded speed
+            // above already scales with inertia, so torques stay sane), legacy
+            // gentle cap for force-limited handles.
+            double torqueCap = iwMax * 60.0;
+            if (params.hasForceLimit()) {
+                torqueCap = angMass * 60.0;
+                if (params.maxForce() > 0.0) {
+                    torqueCap = Math.min(torqueCap, params.maxForce());
+                }
             }
             final double tLen = Math.sqrt(tx * tx + ty * ty + tz * tz);
             if (tLen > torqueCap) {
@@ -481,7 +558,7 @@ public final class SixDofMotors {
                 dev.ryanhcode.sable.Sable.LOGGER.info(
                         "[SableJolt:handle] angServo: desiredW=({}, {}, {}, {}) bodyNow=({}, {}, {}, {}) tau=({}, {}, {}) gain={}",
                         q1wJ.x, q1wJ.y, q1wJ.z, q1wJ.w, bodyNow.x, bodyNow.y, bodyNow.z, bodyNow.w,
-                        tx, ty, tz, gain);
+                        tx, ty, tz, gainEff);
             }
         }
 
@@ -598,6 +675,52 @@ public final class SixDofMotors {
                 vx + qw * tx + (qy * tz - qz * ty),
                 vy + qw * ty + (qz * tx - qx * tz),
                 vz + qw * tz + (qx * ty - qy * tx));
+    }
+
+    private static final ThreadLocal<Vec3> INV_DIAG = ThreadLocal.withInitial(Vec3::new);
+    private static final ThreadLocal<float[]> WORLD_INERTIA = ThreadLocal.withInitial(() -> new float[3]);
+
+    /**
+     * Writes the world-space inertia diagonal of a body into the per-thread
+     * scratch buffer. Falls back to the scalar mass when the motion properties
+     * are unavailable (a locked axis reports zero inverse inertia and keeps
+     * the mass fallback — it cannot be driven anyway).
+     */
+    private static void worldInertiaDiagonal(final Body body, final Quaterniond rot, final float mass) {
+        float ilx = mass, ily = mass, ilz = mass;
+        try {
+            final var motion = body.getMotionProperties();
+            if (motion != null) {
+                final Vec3 inv = INV_DIAG.get();
+                motion.getInverseInertiaDiagonal(inv);
+                if (inv.getX() > 1.0e-12f) {
+                    ilx = 1.0f / inv.getX();
+                }
+                if (inv.getY() > 1.0e-12f) {
+                    ily = 1.0f / inv.getY();
+                }
+                if (inv.getZ() > 1.0e-12f) {
+                    ilz = 1.0f / inv.getZ();
+                }
+            }
+        } catch (final Throwable ignored) {
+            // fall back to mass
+        }
+        // Diagonal of R * diag(il) * R^T from the quaternion.
+        final double x = rot.x, y = rot.y, z = rot.z, w = rot.w;
+        final double r00 = 1.0 - 2.0 * (y * y + z * z);
+        final double r01 = 2.0 * (x * y - z * w);
+        final double r02 = 2.0 * (x * z + y * w);
+        final double r10 = 2.0 * (x * y + z * w);
+        final double r11 = 1.0 - 2.0 * (x * x + z * z);
+        final double r12 = 2.0 * (y * z - x * w);
+        final double r20 = 2.0 * (x * z - y * w);
+        final double r21 = 2.0 * (y * z + x * w);
+        final double r22 = 1.0 - 2.0 * (x * x + y * y);
+        final float[] out = WORLD_INERTIA.get();
+        out[0] = (float) (r00 * r00 * ilx + r01 * r01 * ily + r02 * r02 * ilz);
+        out[1] = (float) (r10 * r10 * ilx + r11 * r11 * ily + r12 * r12 * ilz);
+        out[2] = (float) (r20 * r20 * ilx + r21 * r21 * ily + r22 * r22 * ilz);
     }
 
     /**
