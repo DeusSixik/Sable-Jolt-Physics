@@ -101,7 +101,7 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         settings.setAxisX1(JoltFixedConstraintHandle.rotate((float) frameQ.x, (float) frameQ.y, (float) frameQ.z, (float) frameQ.w, Vec3.sAxisX()));
         settings.setAxisY1(JoltFixedConstraintHandle.rotate((float) frameQ.x, (float) frameQ.y, (float) frameQ.z, (float) frameQ.w, Vec3.sAxisY()));
 
-        for (final EAxis axis : EAxis.values()) {
+        for (final EAxis axis : SixDofMotors.AXES) {
             if (axis == EAxis.Num) {
                 continue;
             }

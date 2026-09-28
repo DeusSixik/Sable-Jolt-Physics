@@ -1676,6 +1676,63 @@ public final class JoltPhysicsScene {
     }
 
     /**
+     * Batched {@link #changeBlock}: one version bump and a single pass over
+     * bodies for {@code count} edits (a block change touches 6 neighbors plus
+     * itself). Unlike the single-block variant — which stops at the first
+     * containing body — every containing body is marked, matching the
+     * {@code addChunk} broadcast behavior; a shared block must not leave the
+     * second overlapping body with a stale shape.
+     */
+    public void changeBlocks(final int[] wx, final int[] wy, final int[] wz,
+                             final int[] packed, final int count) {
+        final long[] keys = new long[count];
+        final boolean[] written = new boolean[count];
+        boolean anyWritten = false;
+        for (int i = 0; i < count; i++) {
+            final long key = ChunkSectionData.packSectionPos(wx[i] >> 4, wy[i] >> 4, wz[i] >> 4);
+            final ChunkSectionData data = this.allChunks.get(key);
+            if (data == null) {
+                continue;
+            }
+            data.set(wx[i] & 15, wy[i] & 15, wz[i] & 15, packed[i]);
+            keys[i] = key;
+            written[i] = true;
+            anyWritten = true;
+        }
+        if (!anyWritten) {
+            return;
+        }
+        this.chunkDataVersion++;
+
+        final boolean[] matched = new boolean[count];
+        for (final SableBody sb : this.bodies.values()) {
+            if (sb.kind == SableBody.Kind.BOX) {
+                continue;
+            }
+            boolean touched = false;
+            for (int i = 0; i < count; i++) {
+                if (written[i] && !matched[i] && sb.contains(wx[i], wy[i], wz[i])) {
+                    matched[i] = true;
+                    touched = true;
+                }
+            }
+            if (touched) {
+                // batched: the actual rebuild runs once per simulation step
+                this.markDirty(sb);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (written[i] && !matched[i]) {
+                final GlobalChunk chunk = this.globalChunks.get(keys[i]);
+                if (chunk != null) {
+                    this.dirtyGlobalChunks.add(chunk);
+                }
+            }
+        }
+    }
+
+    /**
      * Rebuilds the static chunk body's shape from the section data. Static terrain
      * is a MeshShape: shared-edge topology gives Jolt native internal edge removal,
      * so bodies glide across block seams like on the Rapier reference.

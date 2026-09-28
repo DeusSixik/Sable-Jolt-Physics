@@ -50,7 +50,11 @@ public abstract class JoltConstraintHandle {
     }
 
     public boolean isValid() {
-        return this.handle != -1 && this.scene.joint(this.handle) != null && this.scene.joint(this.handle).constraint != null;
+        if (this.handle == -1) {
+            return false;
+        }
+        final JoltPhysicsScene.JointRecord record = this.scene.joint(this.handle);
+        return record != null && record.constraint != null;
     }
 
     protected void assertValid() {

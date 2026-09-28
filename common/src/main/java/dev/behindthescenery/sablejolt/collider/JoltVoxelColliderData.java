@@ -38,19 +38,27 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
     @Nullable public final BlockState sourceState;
 
     /**
+     * Zero-based registry handle assigned at {@link Registry#create} time.
+     * Stored on the entry so per-voxel uploads read a plain field instead of
+     * a synchronized linear {@code indexOf} scan (4096x per chunk section).
+     */
+    public final int colliderHandle;
+
+    /**
      * Lazily built shared shapes, one per box index, reused by every body.
      */
     private volatile ConstShape[] shapes;
 
     JoltVoxelColliderData(final double frictionMultiplier, final double volume, final double restitution,
                           final boolean isFluid, @Nullable final BlockSubLevelCollisionCallback contactEvents,
-                          @Nullable final BlockState sourceState) {
+                          @Nullable final BlockState sourceState, final int colliderHandle) {
         this.frictionMultiplier = (float) frictionMultiplier;
         this.volume = (float) volume;
         this.restitution = (float) restitution;
         this.isFluid = isFluid;
         this.contactEvents = contactEvents;
         this.sourceState = sourceState;
+        this.colliderHandle = colliderHandle;
     }
 
     public boolean needsSpecialContacts() {
@@ -144,7 +152,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
                                                          final double restitution, final boolean isFluid,
                                                          @Nullable final BlockSubLevelCollisionCallback contactEvents,
                                                          @Nullable final BlockState sourceState) {
-            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState);
+            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState, this.entries.size());
             this.entries.add(data);
             this.snapshot = this.entries.toArray(new JoltVoxelColliderData[0]);
             return data;
