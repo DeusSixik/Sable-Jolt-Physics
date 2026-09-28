@@ -131,20 +131,31 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
     public static final class Registry {
         private final List<JoltVoxelColliderData> entries = new ArrayList<>();
 
+        /**
+         * Lock-free read snapshot: {@link #get} is called per block in rebuilds,
+         * per child in buoyancy and per contact in the listener (hot paths, often
+         * from worker threads), while {@link #create}/{@link #clear} run rarely on
+         * the server thread. Publishing an immutable array snapshot keeps reads
+         * allocation-free and synchronization-free with safe publication.
+         */
+        private volatile JoltVoxelColliderData[] snapshot = new JoltVoxelColliderData[0];
+
         public synchronized JoltVoxelColliderData create(final double frictionMultiplier, final double volume,
                                                          final double restitution, final boolean isFluid,
                                                          @Nullable final BlockSubLevelCollisionCallback contactEvents,
                                                          @Nullable final BlockState sourceState) {
             final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState);
             this.entries.add(data);
+            this.snapshot = this.entries.toArray(new JoltVoxelColliderData[0]);
             return data;
         }
 
-        public synchronized JoltVoxelColliderData get(final int handle) {
-            if (handle < 0 || handle >= this.entries.size()) {
+        public JoltVoxelColliderData get(final int handle) {
+            final JoltVoxelColliderData[] arr = this.snapshot;
+            if (handle < 0 || handle >= arr.length) {
                 return null;
             }
-            return this.entries.get(handle);
+            return arr[handle];
         }
 
         public synchronized int indexOf(final JoltVoxelColliderData data) {
@@ -153,6 +164,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
         public synchronized void clear() {
             this.entries.clear();
+            this.snapshot = new JoltVoxelColliderData[0];
         }
     }
 
