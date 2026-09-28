@@ -230,6 +230,11 @@ public final class SixDofMotors {
         final Body b1 = constraint.getBody1();
         final Body b2 = constraint.getBody2();
 
+        // Creative grip: the body was switched to Kinematic on grab and follows
+        // the wand exactly (no gravity, no tip-over). Driven with moveKinematic
+        // instead of forces.
+        final boolean creative = scene != null && scene.isKinematicDrag(joltIdB);
+
         // LINEAR: drive the body with a direct force instead of Jolt velocity
         // motors. Motor commands were measured to translate into ~1% of the
         // commanded velocity on this scene, while addForce (used everywhere else
@@ -241,7 +246,13 @@ public final class SixDofMotors {
                 return;
             }
 
-            final double gain = servoGain(params.stiffness(), effectiveMass(constraint));
+            // Unlimited grip (the creative physics staff sends hasForceLimit=false)
+            // ignores the object's mass for responsiveness: fixed gain instead
+            // of sqrt(K/m). The force itself stays F = m * dv/dt, so tracking is
+            // exact for any weight while contacts still resolve physically.
+            final double gain = params.hasForceLimit()
+                    ? servoGain(params.stiffness(), effectiveMass(constraint))
+                    : MAX_LINEAR_GAIN;
             final float mass = effectiveMass(constraint);
 
             // World-space position of the body-side anchor (double precision; the
@@ -291,6 +302,17 @@ public final class SixDofMotors {
                 dvz = 0.0;
             }
 
+            if (creative) {
+                // Kinematic position follow: advance the center of mass by the
+                // desired velocity step (dv is already clamped to
+                // MAX_LINEAR_SPEED). Jolt derives the body velocity from the
+                // delta, so release throws naturally.
+                scene.getBodyInterface().moveKinematic(joltIdB,
+                        new RVec3(com2.xx() + dvx * DT, com2.yy() + dvy * DT, com2.zz() + dvz * DT),
+                        r2, (float) DT);
+                return;
+            }
+
             // F = m * (vDesired - vBody) / dt. The caller's force limit (Simulated's
             // handleMaxForce) is respected: heavy objects cannot be lifted, light
             // ones are dragged briskly. The force is applied AT the grabbed point
@@ -335,7 +357,12 @@ public final class SixDofMotors {
         double wx = 0.0;
         double wy = 0.0;
         double wz = 0.0;
-        final double gain = servoGain(params.stiffness(), effectiveMass(constraint));
+        // Same mass-independent response for the unlimited (creative) grip as
+        // for the linear axes; the torque cap below stays an angular-acceleration
+        // cap, which is already mass-independent.
+        final double gain = params.hasForceLimit()
+                ? servoGain(params.stiffness(), effectiveMass(constraint))
+                : MAX_LINEAR_GAIN;
         {
 
             final Quat jointLocal = jointFrameQuatLocal == null ? Quat.sIdentity()
@@ -349,6 +376,35 @@ public final class SixDofMotors {
             final Quaterniond desiredW = q1wJ.mul(desiredCs, new Quaterniond());
 
             final Quaterniond bodyNow = new Quaterniond(b2.getRotation().getX(), b2.getRotation().getY(), b2.getRotation().getZ(), b2.getRotation().getW());
+
+            if (creative) {
+                // Kinematic orientation follow, applied once (axis 3 carries the
+                // fresh angular targets; 4 and 5 reuse the same tick's result).
+                // Normalized-lerp towards the desired orientation, clamped to
+                // MAX_ANGULAR_SPEED per tick.
+                if (axisOrdinal == 3) {
+                    double dx = desiredW.x, dy = desiredW.y, dz = desiredW.z, dw = desiredW.w;
+                    double dot = bodyNow.x * dx + bodyNow.y * dy + bodyNow.z * dz + bodyNow.w * dw;
+                    if (dot < 0.0) {
+                        dx = -dx;
+                        dy = -dy;
+                        dz = -dz;
+                        dw = -dw;
+                        dot = -dot;
+                    }
+                    final double angle = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, dot)));
+                    final double alpha = angle > 1.0e-9 ? Math.min(1.0, (MAX_ANGULAR_SPEED * DT) / angle) : 1.0;
+                    final double qx = bodyNow.x + (dx - bodyNow.x) * alpha;
+                    final double qy = bodyNow.y + (dy - bodyNow.y) * alpha;
+                    final double qz = bodyNow.z + (dz - bodyNow.z) * alpha;
+                    final double qw = bodyNow.w + (dw - bodyNow.w) * alpha;
+                    final double inv = 1.0 / Math.sqrt(Math.max(1.0e-18, qx * qx + qy * qy + qz * qz + qw * qw));
+                    scene.getBodyInterface().moveKinematic(joltIdB, b2.getCenterOfMassPosition(),
+                            new Quat((float) (qx * inv), (float) (qy * inv), (float) (qz * inv), (float) (qw * inv)),
+                            (float) DT);
+                }
+                return;
+            }
 
             Vector3d omegaW = scene == null ? null : scene.getCachedAngularOmega(joltIdB);
             if (omegaW == null || axisOrdinal == 3) {

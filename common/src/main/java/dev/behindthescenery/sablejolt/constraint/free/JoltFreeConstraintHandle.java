@@ -143,8 +143,9 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         // release that reads as the object wildly spinning for several turns.
         // Damp it here — both for the per-tick constraint recreation and for the
         // final release.
+        JoltPhysicsScene.JointRecord record = null;
         try {
-            final JoltPhysicsScene.JointRecord record = this.record();
+            record = this.record();
             if (record != null && record.constraint instanceof final SixDofConstraint constraint) {
                 final Body body = constraint.getBody2();
                 if (body != null && body.isDynamic()) {
@@ -157,6 +158,18 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         } catch (final Throwable ignored) {
             // never block removal on diagnostics
         }
+        // End of a kinematic drag (or a per-tick recreation — the restore is
+        // deferred to the next step start, so recreation is harmless).
+        try {
+            if (record == null) {
+                record = this.record();
+            }
+            if (record != null) {
+                this.scene.endKinematicDrag(record.joltIdB);
+            }
+        } catch (final Throwable ignored) {
+            // never block removal on bookkeeping
+        }
         super.remove();
     }
 
@@ -168,6 +181,11 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         }
 
         this.motors[axisOrdinal] = new SixDofMotors.MotorParams(target, stiffness, damping, hasForceLimit, maxForce);
+        // Creative grip (no force limit = physics staff): the body goes
+        // kinematic and follows the wand exactly, ignoring gravity and weight.
+        if (!hasForceLimit && axisOrdinal < 3) {
+            this.scene.beginKinematicDrag(record.joltIdB);
+        }
         SixDofMotors.applyMotorFree(constraint, this.settings, axisOrdinal, this.motors, this.scene,
                 record.joltIdA, record.joltIdB, this.frameQuat, this.targetWorld, this.renderFrameServo, this.subLevel);
     }
