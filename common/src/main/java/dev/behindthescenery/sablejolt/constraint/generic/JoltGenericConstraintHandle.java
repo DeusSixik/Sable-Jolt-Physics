@@ -66,14 +66,14 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
         settings.setAxisX2(JoltFixedConstraintHandle.rotate((float) rotB.x(), (float) rotB.y(), (float) rotB.z(), (float) rotB.w(), Vec3.sAxisX()));
         settings.setAxisY2(JoltFixedConstraintHandle.rotate((float) rotB.x(), (float) rotB.y(), (float) rotB.z(), (float) rotB.w(), Vec3.sAxisY()));
 
-        for (final EAxis axis : EAxis.values()) {
+        for (final EAxis axis : SixDofMotors.AXES) {
             if (axis == EAxis.Num) {
                 continue;
             }
             settings.makeFreeAxis(axis);
         }
         for (final ConstraintJointAxis locked : config.lockedAxes()) {
-            settings.makeFixedAxis(EAxis.values()[locked.ordinal()]);
+            settings.makeFixedAxis(SixDofMotors.AXES[locked.ordinal()]);
         }
 
         final SixDofConstraint constraint = (SixDofConstraint) scene.createConstraint(settings, joltA, joltB);
@@ -137,16 +137,17 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
     @Override
     public void setLimit(final ConstraintJointAxis axis, final double min, final double max) {
         this.assertValid();
-        if (!(this.record().constraint instanceof final SixDofConstraint constraint)) {
+        final JoltPhysicsScene.JointRecord record = this.record();
+        if (record == null || !(record.constraint instanceof final SixDofConstraint constraint)) {
             return;
         }
-        this.record().limits[axis.ordinal()][0] = min;
-        this.record().limits[axis.ordinal()][1] = max;
+        record.limits[axis.ordinal()][0] = min;
+        record.limits[axis.ordinal()][1] = max;
         this.applyLimits(constraint, axis.ordinal(), min, max);
     }
 
     private static void applyLimits(final SixDofConstraint constraint, final int axisOrdinal, final double min, final double max) {
-        final EAxis axis = EAxis.values()[axisOrdinal];
+        final EAxis axis = SixDofMotors.AXES[axisOrdinal];
         if (axis.ordinal() < 3) {
             final Vec3 minV = constraint.getTranslationLimitsMin();
             final Vec3 maxV = constraint.getTranslationLimitsMax();
@@ -173,12 +174,13 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
     @Override
     public void lockAxes(final ConstraintJointAxis @NotNull... axes) {
         this.assertValid();
-        if (!(this.record().constraint instanceof final SixDofConstraint constraint)) {
+        final JoltPhysicsScene.JointRecord record = this.record();
+        if (record == null || !(record.constraint instanceof final SixDofConstraint constraint)) {
             return;
         }
 
         for (final ConstraintJointAxis axis : axes) {
-            this.record().locked[axis.ordinal()] = true;
+            record.locked[axis.ordinal()] = true;
             // a locked axis is a limited axis with min == max == 0
             this.applyLimits(constraint, axis.ordinal(), 0.0, 0.0);
         }
@@ -212,9 +214,9 @@ public class JoltGenericConstraintHandle extends JoltConstraintHandle implements
 
         for (int i = 0; i < 6; i++) {
             if (record.locked[i] || (record.limits[i][0] == 0.0 && record.limits[i][1] == 0.0 && isLockedDefault(i))) {
-                settings.makeFixedAxis(EAxis.values()[i]);
+                settings.makeFixedAxis(SixDofMotors.AXES[i]);
             } else {
-                settings.makeFreeAxis(EAxis.values()[i]);
+                settings.makeFreeAxis(SixDofMotors.AXES[i]);
             }
         }
 

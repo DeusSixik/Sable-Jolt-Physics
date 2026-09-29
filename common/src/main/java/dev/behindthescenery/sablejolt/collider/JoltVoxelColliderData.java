@@ -3,9 +3,9 @@ package dev.behindthescenery.sablejolt.collider;
 import com.github.stephengold.joltjni.BoxShape;
 import com.github.stephengold.joltjni.Vec3;
 import com.github.stephengold.joltjni.readonly.ConstShape;
-import dev.ryanhcode.sable.api.block.BlockSubLevelCollisionShape;
 import dev.ryanhcode.sable.api.physics.callback.BlockSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.collider.VoxelColliderData;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import net.minecraft.world.level.block.state.BlockState;
 import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.Nullable;
@@ -21,10 +21,11 @@ import java.util.List;
  */
 @ApiStatus.Internal
 public final class JoltVoxelColliderData implements VoxelColliderData {
+
     /**
      * The boxes of this collider, formatted [minX, minY, minZ, maxX, maxY, maxZ] within 0-1 block space.
      */
-    public final List<float[]> boxes = new ArrayList<>(4);
+    public final ObjectArrayList<VoxelBox> boxes = new ObjectArrayList<>(4);
     public final boolean isFluid;
     public final float frictionMultiplier;
     public final float volume;
@@ -37,19 +38,27 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
     @Nullable public final BlockState sourceState;
 
     /**
+     * Zero-based registry handle assigned at {@link Registry#create} time.
+     * Stored on the entry so per-voxel uploads read a plain field instead of
+     * a synchronized linear {@code indexOf} scan (4096x per chunk section).
+     */
+    public final int colliderHandle;
+
+    /**
      * Lazily built shared shapes, one per box index, reused by every body.
      */
     private volatile ConstShape[] shapes;
 
     JoltVoxelColliderData(final double frictionMultiplier, final double volume, final double restitution,
                           final boolean isFluid, @Nullable final BlockSubLevelCollisionCallback contactEvents,
-                          @Nullable final BlockState sourceState) {
+                          @Nullable final BlockState sourceState, final int colliderHandle) {
         this.frictionMultiplier = (float) frictionMultiplier;
         this.volume = (float) volume;
         this.restitution = (float) restitution;
         this.isFluid = isFluid;
         this.contactEvents = contactEvents;
         this.sourceState = sourceState;
+        this.colliderHandle = colliderHandle;
     }
 
     public boolean needsSpecialContacts() {
@@ -85,11 +94,11 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
                     this.shapes = arr;
                 }
                 if (boxIndex < arr.length && arr[boxIndex] == null) {
-                    final float[] b = this.boxes.get(boxIndex);
-                    final float hx = Math.max((b[3] - b[0]) * 0.5f, 0.0001f);
-                    final float hy = Math.max((b[4] - b[1]) * 0.5f, 0.0001f);
-                    final float hz = Math.max((b[5] - b[2]) * 0.5f, 0.0001f);
-                    arr[boxIndex] = new BoxShape(new Vec3(hx, hy, hz), 0.025f);
+                    final VoxelBox b = this.boxes.get(boxIndex);
+                    final float hx = Math.max((b.maxX - b.minX) * 0.5f, 0.0001f);
+                    final float hy = Math.max((b.maxY - b.minY) * 0.5f, 0.0001f);
+                    final float hz = Math.max((b.maxZ - b.minZ) * 0.5f, 0.0001f);
+                    arr[boxIndex] = new BoxShape(hx, hy, hz, 0.025f);
                 }
             }
         }
@@ -98,11 +107,23 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
     @Override
     public void addBox(final Vector3dc min, final Vector3dc max) {
-        this.boxes.add(new float[]{
+        this.boxes.add(new VoxelBox(
                 (float) min.x(), (float) min.y(), (float) min.z(),
                 (float) max.x(), (float) max.y(), (float) max.z()
-        });
+        ));
         this.shapes = null;
+    }
+
+    public void addBox(final double minX, final double minY, final double minZ,
+                       final double maxX, final double maxY, final double maxZ) {
+        this.addBox((float) minX, (float) minY, (float) minZ, (float) maxX, (float) maxY, (float) maxZ);
+    }
+
+    public void addBox(final float minX, final float minY, final float minZ,
+                       final float maxX, final float maxY, final float maxZ) {
+        this.boxes.add(new VoxelBox(
+                minX, minY, minZ, maxX, maxY, maxZ
+        ));
     }
 
     @Override
@@ -118,20 +139,31 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
     public static final class Registry {
         private final List<JoltVoxelColliderData> entries = new ArrayList<>();
 
+        /**
+         * Lock-free read snapshot: {@link #get} is called per block in rebuilds,
+         * per child in buoyancy and per contact in the listener (hot paths, often
+         * from worker threads), while {@link #create}/{@link #clear} run rarely on
+         * the server thread. Publishing an immutable array snapshot keeps reads
+         * allocation-free and synchronization-free with safe publication.
+         */
+        private volatile JoltVoxelColliderData[] snapshot = new JoltVoxelColliderData[0];
+
         public synchronized JoltVoxelColliderData create(final double frictionMultiplier, final double volume,
                                                          final double restitution, final boolean isFluid,
                                                          @Nullable final BlockSubLevelCollisionCallback contactEvents,
                                                          @Nullable final BlockState sourceState) {
-            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState);
+            final JoltVoxelColliderData data = new JoltVoxelColliderData(frictionMultiplier, volume, restitution, isFluid, contactEvents, sourceState, this.entries.size());
             this.entries.add(data);
+            this.snapshot = this.entries.toArray(new JoltVoxelColliderData[0]);
             return data;
         }
 
-        public synchronized JoltVoxelColliderData get(final int handle) {
-            if (handle < 0 || handle >= this.entries.size()) {
+        public JoltVoxelColliderData get(final int handle) {
+            final JoltVoxelColliderData[] arr = this.snapshot;
+            if (handle < 0 || handle >= arr.length) {
                 return null;
             }
-            return this.entries.get(handle);
+            return arr[handle];
         }
 
         public synchronized int indexOf(final JoltVoxelColliderData data) {
@@ -140,6 +172,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
         public synchronized void clear() {
             this.entries.clear();
+            this.snapshot = new JoltVoxelColliderData[0];
         }
     }
 
@@ -150,7 +183,39 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
         return dest.set((box[0] + box[3]) * 0.5, (box[1] + box[4]) * 0.5, (box[2] + box[5]) * 0.5);
     }
 
+    /**
+     * Builds the shared shapes of every known entry. Used after bulk edits.
+     */
+    public static Vector3d boxCenter(final float minX, final float minY, final float minZ,
+                                     final float maxX, final float maxY, final float maxZ,
+                                     final Vector3d dest) {
+        return dest.set((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5);
+    }
+
     public static Vector3d boxHalfExtent(final float[] box, final Vector3d dest) {
         return dest.set((box[3] - box[0]) * 0.5, (box[4] - box[1]) * 0.5, (box[5] - box[2]) * 0.5);
+    }
+
+    public static Vector3d boxHalfExtent(final float minX, final float minY, final float minZ,
+                                         final float maxX, final float maxY, final float maxZ,
+                                         final Vector3d dest) {
+        return dest.set((maxX - minX) * 0.5, (maxY - minY) * 0.5, (maxZ - minZ) * 0.5);
+    }
+
+    public static class VoxelBox {
+        public float minX, minY, minZ, maxX, maxY, maxZ;
+
+        public VoxelBox(float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+            this.minX = minX;
+            this.minY = minY;
+            this.minZ = minZ;
+            this.maxX = maxX;
+            this.maxY = maxY;
+            this.maxZ = maxZ;
+        }
+
+        public final boolean fullCube() {
+            return minX == 0 && minY == 0 && minZ == 0 && maxX == 0 && maxY == 1 && maxZ == 1;
+        }
     }
 }

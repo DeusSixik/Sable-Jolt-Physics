@@ -48,7 +48,7 @@ public class JoltVoxelColliderBakery {
         final JoltVoxelColliderData entry = this.registry.create(friction, volume, restitution, liquid, callback, childState);
 
         if (liquid) {
-            entry.addBox(JOMLConversion.ZERO, new Vector3d(1.0, 1.0, 1.0));
+            entry.addBox(0f,0f,0f, 1.0f, 1.0f, 1.0f);
         } else {
             this.buildBoxesInto(entry, childState);
         }
@@ -75,8 +75,8 @@ public class JoltVoxelColliderBakery {
         this.level.setup(Blocks.AIR.defaultBlockState());
 
         shape.forAllBoxes((minX, minY, minZ, maxX, maxY, maxZ) -> entry.addBox(
-                new Vector3d(Math.max(minX, 0.0), Math.max(minY, 0.0), Math.max(minZ, 0.0)),
-                new Vector3d(Math.min(maxX, 1.0), Math.min(maxY, 1.0), Math.min(maxZ, 1.0))
+                Math.max(minX, 0.0), Math.max(minY, 0.0), Math.max(minZ, 0.0),
+                Math.min(maxX, 1.0), Math.min(maxY, 1.0), Math.min(maxZ, 1.0)
         ));
     }
 

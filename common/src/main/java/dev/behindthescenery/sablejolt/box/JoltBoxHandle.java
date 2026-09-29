@@ -12,14 +12,14 @@ import org.joml.Vector3dc;
 public final class JoltBoxHandle implements BoxHandle {
     private final JoltPhysicsScene scene;
     private final int id;
+    private final JoltPhysicsScene.PoseCache cache = new JoltPhysicsScene.PoseCache();
 
     public static JoltBoxHandle create(final JoltPhysicsScene scene, final Pose3dc pose, final Vector3dc halfExtents, final double mass) {
         final Vector3dc pos = pose.position();
         final Quaterniondc rot = pose.orientation();
 
         final int id = scene.nextRuntimeId();
-        scene.createBox(id, mass, halfExtents.x(), halfExtents.y(), halfExtents.z(),
-                new double[]{pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()});
+        scene.createBox(id, mass, halfExtents.x(), halfExtents.y(), halfExtents.z(), pos, rot);
         return new JoltBoxHandle(scene, id);
     }
 
@@ -33,11 +33,10 @@ public final class JoltBoxHandle implements BoxHandle {
      */
     @Override
     public void readPose(final Pose3d dest) {
-        final double[] cache = new double[7];
-        this.scene.getPose(this.id, cache);
+        this.scene.getPose(this.id, this.cache);
 
-        dest.position().set(cache[0], cache[1], cache[2]);
-        dest.orientation().set(cache[3], cache[4], cache[5], cache[6]);
+        dest.position().set(this.cache.p1, this.cache.p2, this.cache.p3);
+        dest.orientation().set(this.cache.p4, this.cache.p5, this.cache.p6, this.cache.p7);
     }
 
     /**

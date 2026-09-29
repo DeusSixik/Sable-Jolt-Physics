@@ -7,6 +7,7 @@ import com.github.stephengold.joltjni.Quat;
 import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.SixDofConstraint;
 import com.github.stephengold.joltjni.Vec3;
+import com.github.stephengold.joltjni.enumerate.EActivation;
 import com.github.stephengold.joltjni.enumerate.EAxis;
 import com.github.stephengold.joltjni.enumerate.EMotorState;
 import dev.behindthescenery.sablejolt.JoltDebugLogging;
@@ -41,6 +42,42 @@ public final class SixDofMotors {
     public static final int AXIS_COUNT = 6;
 
     /**
+     * Cached enum values: {@code EAxis.values()} allocates a fresh array on
+     * every call, and it sits in per-axis motor paths.
+     */
+    public static final EAxis[] AXES = EAxis.values();
+
+    /**
+     * Shared identity rotation. Jolt setters only read the components, so one
+     * instance serves all calls; {@code Quat.sIdentity()} allocates per call.
+     */
+    private static final Quat IDENTITY_QUAT = new Quat(0.0f, 0.0f, 0.0f, 1.0f);
+
+    /**
+     * Per-thread servo scratch: body rotations, joint frames, rotated vectors,
+     * centers of mass and quaternion intermediates. Each slot has a single
+     * live range per call (documented at use); Jolt/JOML calls below read the
+     * components immediately, so sharing is exact.
+     */
+    private static final ThreadLocal<Quat> QR1 = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Quat> QR2 = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Quat> Q_JOINT = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Quat> Q_Q1W = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Quat> Q_Q1WINV = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Vec3> V_ROT = ThreadLocal.withInitial(Vec3::new);
+    private static final ThreadLocal<Vec3> V_VEL = ThreadLocal.withInitial(Vec3::new);
+    private static final ThreadLocal<RVec3> C_COM = ThreadLocal.withInitial(RVec3::new);
+    private static final ThreadLocal<RVec3> C_COM2 = ThreadLocal.withInitial(RVec3::new);
+    private static final ThreadLocal<Quat> Q_INV = ThreadLocal.withInitial(Quat::new);
+    private static final ThreadLocal<Quaterniond> QD_A = ThreadLocal.withInitial(Quaterniond::new);
+    private static final ThreadLocal<Quaterniond> QD_B = ThreadLocal.withInitial(Quaterniond::new);
+    private static final ThreadLocal<Quaterniond> QD_C = ThreadLocal.withInitial(Quaterniond::new);
+    private static final ThreadLocal<Quaterniond> QD_D = ThreadLocal.withInitial(Quaterniond::new);
+    private static final ThreadLocal<Quaterniond> QD_E = ThreadLocal.withInitial(Quaterniond::new);
+    private static final ThreadLocal<Vector3d> VEC_OMEGA = ThreadLocal.withInitial(Vector3d::new);
+    private static final ThreadLocal<Vector3d> VEC_LINPOS = ThreadLocal.withInitial(Vector3d::new);
+
+    /**
      * Servo caps. The velocity command is applied instantly by the solver, so the
      * caps must be low enough to prevent bang-bang oscillation around the target:
      * linear drag stays at walking-to-sprint speed, rotation at ~460 deg/s with the
@@ -50,6 +87,36 @@ public final class SixDofMotors {
     private static final double MAX_ANGULAR_SPEED = 6.0;
     private static final double MAX_ANGULAR_TOTAL_SPEED = 8.0;
     private static final double MAX_LINEAR_GAIN = 8.0;
+    /**
+     * Max acceleration (m/s^2) of the creative linear drive, scaled by mass.
+     * Free-space tracking stays exact (it needs only a few m/s^2), but the
+     * drive now yields to terrain contacts instead of embedding the body —
+     * an uncapped servo always wins against the solver.
+     */
+    private static final double CREATIVE_MAX_ACCEL = 40.0;
+    /**
+     * Tip-speed limit (m/s) of creative rotation: the same rad/s looks r times
+     * faster on a huge body, so the angular cap is derived from the edge speed
+     * instead. Estimated radius comes from inertia (r = sqrt(3*I/m)).
+     */
+    private static final double TIP_SPEED_MAX = 5.0;
+    /**
+     * Max orientation step (rad/tick) of the creative snap for small bodies;
+     * huge bodies are additionally limited by {@link #SNAP_TIP_SPEED}.
+     */
+    private static final double SNAP_MAX_STEP = 0.15;
+    /**
+     * Bodies with an estimated radius below this (m) snap instantly — no lag,
+     * no catching up. Above it the tip-speed limit applies, otherwise a huge
+     * body would sweep its ends through the terrain on grab.
+     */
+    private static final double SNAP_INSTANT_RADIUS = 8.0;
+    /**
+     * Edge-speed limit (m/s) of the creative orientation snap: snapping a huge
+     * body across its full error in one tick would sweep its ends through the
+     * terrain.
+     */
+    private static final double SNAP_TIP_SPEED = 12.0;
 
     /**
      * Sable physics tick rate.
@@ -75,7 +142,7 @@ public final class SixDofMotors {
             return;
         }
 
-        final EAxis axis = EAxis.values()[axisOrdinal];
+        final EAxis axis = AXES[axisOrdinal];
         constraint.setMotorState(axis, EMotorState.Velocity);
 
         final MotorSettings motor = constraint.getMotorSettings(axis);
@@ -86,7 +153,7 @@ public final class SixDofMotors {
 
         final double gain = servoGain(params.stiffness(), effectiveMass(constraint));
 
-        final Vector3d current = currentLinearPositionCs(constraint, settings, jointFrameQuatLocal);
+        final Vector3d current = currentLinearPositionCs(constraint, settings, jointFrameQuatLocal, VEC_LINPOS.get());
         double vx = (targetOf(state, 0) - current.x) * gain;
         double vy = (targetOf(state, 1) - current.y) * gain;
         double vz = (targetOf(state, 2) - current.z) * gain;
@@ -102,7 +169,7 @@ public final class SixDofMotors {
             vy = 0.0;
             vz = 0.0;
         }
-        constraint.setTargetVelocityCs(new Vec3((float) vx, (float) vy, (float) vz));
+        constraint.setTargetVelocityCs((float) vx, (float) vy, (float) vz);
 
         // ANGULAR: a velocity servo expressed in WORLD space (stable across the
         // per-tick constraint recreation):
@@ -115,30 +182,36 @@ public final class SixDofMotors {
         if (axisOrdinal >= 3) {
             final Body b1 = constraint.getBody1();
             final Body b2 = constraint.getBody2();
-            final Quat r1 = b1.getRotation();
-            final Quat r2 = b2.getRotation();
+            b1.getRotation(QR1.get());
+            b2.getRotation(QR2.get());
+            final Quat r1 = QR1.get();
+            final Quat r2 = QR2.get();
 
-            final Quat jointLocal = jointFrameQuatLocal == null ? Quat.sIdentity()
-                    : new Quat((float) jointFrameQuatLocal.x, (float) jointFrameQuatLocal.y,
-                            (float) jointFrameQuatLocal.z, (float) jointFrameQuatLocal.w);
+            final Quat jointLocal = scratchJointLocal(jointFrameQuatLocal);
             // world rotation of joint frame 1
-            final Quat q1w = mulQuat(r1, jointLocal);
-            final Quaterniond q1wJ = new Quaterniond(q1w.getX(), q1w.getY(), q1w.getZ(), q1w.getW());
+            final Quat q1w = mulQuatInto(r1, jointLocal, Q_Q1W.get());
+            final Quaterniond q1wJ = QD_A.get().set(q1w.getX(), q1w.getY(), q1w.getZ(), q1w.getW());
 
             // desired world rotation of body 2 = frame1 world rotation * target (constraint space)
-            final Quaterniond desiredCs = new Quaterniond().rotationXYZ(targetOf(state, 3), targetOf(state, 4), targetOf(state, 5));
-            final Quaterniond desiredW = q1wJ.mul(desiredCs, new Quaterniond());
+            final Quaterniond desiredCs = QD_B.get().identity().rotationXYZ(targetOf(state, 3), targetOf(state, 4), targetOf(state, 5));
+            final Quaterniond desiredW = q1wJ.mul(desiredCs, QD_C.get());
 
-            final Quaterniond bodyNow = new Quaterniond(r2.getX(), r2.getY(), r2.getZ(), r2.getW());
+            final Quaterniond bodyNow = QD_D.get().set(r2.getX(), r2.getY(), r2.getZ(), r2.getW());
 
             // follow term: track the target frame's rotation speed (unwrapped by
             // per-tick shortest-arc deltas, which are always small)
             Vector3d omegaW = scene == null ? null : scene.getCachedAngularOmega(joltIdB);
             if (omegaW == null || axisOrdinal == 3) {
-                omegaW = new Vector3d();
+                omegaW = VEC_OMEGA.get();
+                omegaW.set(0.0, 0.0, 0.0);
+                // QD_B (desiredCs) is dead past the desiredW computation above;
+                // QD_D (bodyNow) must survive for the correction term and debug.
+                final Quaterniond delta = QD_B.get();
                 final Quaterniond prevDesired = scene == null ? null : scene.getAngularFollowPrev(joltIdB);
                 if (prevDesired != null) {
-                    final Quaterniond delta = shortestArc(desiredW.mul(prevDesired.conjugate(new Quaterniond()), new Quaterniond()));
+                    prevDesired.conjugate(QD_E.get());
+                    desiredW.mul(QD_E.get(), delta);
+                    shortestArcInto(delta);
                     final double ang = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, delta.w)));
                     if (ang > 1.0e-5) {
                         final double s = Math.sqrt(Math.max(0.0, 1.0 - delta.w * delta.w));
@@ -149,7 +222,10 @@ public final class SixDofMotors {
                 }
 
                 // correction term: pull the remaining orientation error to zero
-                final Quaterniond errW = shortestArc(desiredW.mul(bodyNow.conjugate(new Quaterniond()), new Quaterniond()));
+                bodyNow.conjugate(QD_E.get());
+                desiredW.mul(QD_E.get(), delta);
+                shortestArcInto(delta);
+                final Quaterniond errW = delta;
                 final double errAngle = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, errW.w)));
                 if (errAngle > 1.0e-5) {
                     final double s = Math.sqrt(Math.max(0.0, 1.0 - errW.w * errW.w));
@@ -177,12 +253,14 @@ public final class SixDofMotors {
             }
 
             // world -> constraint space (frame 1 rotation)
-            final Quat q1wInv = q1w.conjugated();
-            final Vec3 wCs = rotate(new Vec3((float) omegaW.x, (float) omegaW.y, (float) omegaW.z), q1wInv);
+            final Quat q1wInv = Q_Q1WINV.get();
+            q1wInv.set(-q1w.getX(), -q1w.getY(), -q1w.getZ(), q1w.getW());
+            final Vec3 wCs = V_ROT.get();
+            rotateInto((float) omegaW.x, (float) omegaW.y, (float) omegaW.z, q1wInv, wCs);
             wx = wCs.getX();
             wy = wCs.getY();
             wz = wCs.getZ();
-            constraint.setTargetAngularVelocityCs(new Vec3((float) wx, (float) wy, (float) wz));
+            constraint.setTargetAngularVelocityCs((float) wx, (float) wy, (float) wz);
         }
 
         // Jolt motors never wake attached bodies; the gun expects immediate response
@@ -201,6 +279,377 @@ public final class SixDofMotors {
         }
     }
 
+    /**
+     * Free-constraint servo with externally measured error. Identical to
+     * {@link #applyMotor} except that the linear constraint-space position is
+     * computed in double precision from body poses instead of from the
+     * (float) constraint anchors вЂ” mandatory at plot coordinates where float
+     * quantization of millions-of-blocks deltas destroys the servo.
+     *
+     * @param targetWorld scene-frame world anchor of the body 1 side (used when
+     *        {@code renderFrameServo} is false вЂ” the anchor geometry carries the
+     *        target and motor targets are zero, the iron-handle pattern)
+     * @param renderFrameServo when true, the caller drives per-tick joint-space
+     *        targets expressed in the render frame (the physics-staff pattern);
+     *        the body anchor is measured through the sub-level's logical pose
+     * @param subLevel the sub-level of body 2 (needed for the render-frame measure)
+     */
+    public static void applyMotorFree(final SixDofConstraint constraint, final com.github.stephengold.joltjni.SixDofConstraintSettings settings,
+                                      final int axisOrdinal, @Nullable final MotorParams[] state,
+                                      final JoltPhysicsScene scene, final int joltIdA, final int joltIdB,
+                                      @Nullable final Quaterniond jointFrameQuatLocal,
+                                      final Vector3d targetWorld, final boolean renderFrameServo,
+                                      @Nullable final dev.ryanhcode.sable.sublevel.ServerSubLevel subLevel) {
+        final MotorParams params = state[axisOrdinal];
+        if (params == null) {
+            return;
+        }
+
+        // LINEAR: drive the body with a direct force instead of Jolt velocity
+        // motors. Motor commands were measured to translate into ~1% of the
+        // commanded velocity on this scene, while addForce (used everywhere else
+        // in this scene) is known-good. The servo computes the desired velocity
+        // from the position error and applies F = m * (vDesired - vBody) / dt.
+        if (axisOrdinal < 3) {
+            // All three linear targets must be known before the force is applied.
+            // Axes 0/1 exit here with no side effects (previously they still
+            // paid two JNI body fetches before reaching this gate).
+            if (axisOrdinal != 2 || state[0] == null || state[1] == null) {
+                return;
+            }
+
+            final Body b1 = constraint.getBody1();
+            final Body b2 = constraint.getBody2();
+
+            // Unlimited grip (the creative physics staff sends hasForceLimit=false)
+            // ignores the object's mass for responsiveness: fixed gain instead
+            // of sqrt(K/m). The force itself stays F = m * dv/dt, so tracking is
+            // exact for any weight while contacts still resolve physically.
+            // Single mass read: the two original calls were adjacent with no
+            // simulation step between them, hence bit-identical values.
+            final float mass = effectiveMass(constraint);
+            final double gain = params.hasForceLimit()
+                    ? servoGain(params.stiffness(), mass)
+                    : MAX_LINEAR_GAIN;
+
+            // World-space position of the body-side anchor (double precision; the
+            // anchor offset is small so the float rotation stays accurate).
+            b2.getCenterOfMassPosition(C_COM.get());
+            b2.getRotation(QR2.get());
+            final RVec3 com2 = C_COM.get();
+            final Quat r2 = QR2.get();
+            final var p2 = settings.getPosition2();
+            final Vec3 a2 = V_ROT.get();
+            rotateInto((float) p2.xx(), (float) p2.yy(), (float) p2.zz(), r2, a2);
+            final double axW = com2.xx() + a2.getX();
+            final double ayW = com2.yy() + a2.getY();
+            final double azW = com2.zz() + a2.getZ();
+
+            final Quat jointLocal = scratchJointLocal(jointFrameQuatLocal);
+            b1.getRotation(QR1.get());
+            final Quat q1w = mulQuatInto(QR1.get(), jointLocal, Q_Q1W.get());
+            final Quat q1wInv = Q_Q1WINV.get();
+            q1wInv.set(-q1w.getX(), -q1w.getY(), -q1w.getZ(), q1w.getW());
+
+            // Position error in the joint frame (small numbers only), then the
+            // desired velocity rotated back to world space. The staff feeds
+            // render-frame targets; the scene lives in the render frame too, so
+            // no pose projection is required for the body anchor.
+            final double refX = renderFrameServo ? 0.0 : targetWorld.x;
+            final double refY = renderFrameServo ? 0.0 : targetWorld.y;
+            final double refZ = renderFrameServo ? 0.0 : targetWorld.z;
+            final Vec3 curCs = V_ROT.get();
+            rotateInto((float) (axW - refX), (float) (ayW - refY), (float) (azW - refZ), q1wInv, curCs);
+            final double ecx = targetOf(state, 0) - curCs.getX();
+            final double ecy = targetOf(state, 1) - curCs.getY();
+            final double ecz = targetOf(state, 2) - curCs.getZ();
+
+            // Desired velocity = clamped error * gain, rotated to world space.
+            final double errLen = Math.sqrt(ecx * ecx + ecy * ecy + ecz * ecz);
+            double dvx = 0.0;
+            double dvy = 0.0;
+            double dvz = 0.0;
+            if (errLen > 1.0e-9) {
+                final double speed = Math.min(errLen * gain, MAX_LINEAR_SPEED);
+                final double scale = speed / errLen;
+                final Vec3 dv = V_ROT.get();
+                rotateInto((float) (ecx * scale), (float) (ecy * scale), (float) (ecz * scale), q1w, dv);
+                dvx = dv.getX();
+                dvy = dv.getY();
+                dvz = dv.getZ();
+            }
+            if (!isFinite(dvx) || !isFinite(dvy) || !isFinite(dvz)) {
+                dvx = 0.0;
+                dvy = 0.0;
+                dvz = 0.0;
+            }
+
+            // F = m * (vDesired - vBody) / dt. The caller's force limit (Simulated's
+            // handleMaxForce) is respected: heavy objects cannot be lifted, light
+            // ones are dragged briskly. Force-limited handles apply the force AT
+            // the grabbed point so dragging produces realistic tilt torque.
+            // The creative grip instead applies it at the center of mass: with
+            // uncapped forces an off-center application feeds rotation back into
+            // the position error (anchor swings around the COM) — a self-spin
+            // and slingshot loop. Orientation is driven solely by the angular
+            // servo, so the body glides without induced spin.
+            b2.getLinearVelocity(V_VEL.get());
+            final Vec3 vel = V_VEL.get();
+            double fx = mass * (dvx - vel.getX()) / DT;
+            double fy = mass * (dvy - vel.getY()) / DT;
+            double fz = mass * (dvz - vel.getZ()) / DT;
+            final double fLen = Math.sqrt(fx * fx + fy * fy + fz * fz);
+            if (params.hasForceLimit() && params.maxForce() > 0.0 && fLen > params.maxForce()) {
+                final double scale = params.maxForce() / fLen;
+                fx *= scale;
+                fy *= scale;
+                fz *= scale;
+            } else if (!params.hasForceLimit()) {
+                final double cap = mass * CREATIVE_MAX_ACCEL;
+                if (fLen > cap) {
+                    final double scale = cap / fLen;
+                    fx *= scale;
+                    fy *= scale;
+                    fz *= scale;
+                }
+            }
+            if (isFinite(fx) && isFinite(fy) && isFinite(fz)) {
+                if (params.hasForceLimit()) {
+                    b2.addForce((float) fx, (float) fy, (float) fz, axW, ayW, azW);
+                } else {
+                    b2.addForce((float) fx, (float) fy, (float) fz, com2.xx(), com2.yy(), com2.zz());
+                }
+            }
+
+            // Jolt never wakes bodies for out-of-band forces; the tools expect
+            // immediate response.
+            scene.getBodyInterface().activateBody(joltIdA);
+            scene.getBodyInterface().activateBody(joltIdB);
+
+            if (JoltDebugLogging.HANDLE) {
+                final Vector3d current = new Vector3d(ecx, ecy, ecz);
+                dev.ryanhcode.sable.Sable.LOGGER.info(
+                        "[SableJolt:handle] linServo: body={} act={} vel=({}, {}, {}) com=({}, {}, {}) anchor2W=({}, {}, {}) tgt=({}, {}, {}) err=({}, {}, {}) F=({}, {}, {}) gain={} mass={} mode={}",
+                        joltIdB, b2.isActive(), vel.getX(), vel.getY(), vel.getZ(),
+                        com2.xx(), com2.yy(), com2.zz(), axW, ayW, azW,
+                        targetWorld.x, targetWorld.y, targetWorld.z,
+                        current.x, current.y, current.z, fx, fy, fz,
+                        gain, mass, renderFrameServo ? "render" : "world");
+            }
+            return;
+        }
+
+        final Body b1 = constraint.getBody1();
+        final Body b2 = constraint.getBody2();
+
+        // ANGULAR: direct torque drive (Jolt velocity motors proved unreliable
+        // here). Spring-damper towards the target orientation, force-limited by
+        // the caller (handleMaxForce) so the handle stays a gentle guide and the
+        // body can physically tilt and swing.
+        double wx = 0.0;
+        double wy = 0.0;
+        double wz = 0.0;
+        // Legacy mass-based gain for force-limited handles (iron handle
+        // feel); the creative grip gets an inertia-scaled response below,
+        // once the world inertia is known. Single mass read: the two original
+        // calls were adjacent with no simulation step between them.
+        final float angMass = effectiveMass(constraint);
+        final double gain = params.hasForceLimit()
+                ? servoGain(params.stiffness(), angMass)
+                : MAX_LINEAR_GAIN;
+        {
+
+            final Quat jointLocal = scratchJointLocal(jointFrameQuatLocal);
+            b1.getRotation(QR1.get());
+            final Quat q1w = mulQuatInto(QR1.get(), jointLocal, Q_Q1W.get());
+
+            final Quaterniond q1wJ = QD_A.get().set(q1w.getX(), q1w.getY(), q1w.getZ(), q1w.getW());
+
+            final Quaterniond desiredCs = QD_B.get().identity().rotationXYZ(targetOf(state, 3), targetOf(state, 4), targetOf(state, 5));
+            final Quaterniond desiredW = q1wJ.mul(desiredCs, QD_C.get());
+
+            b2.getRotation(QR2.get());
+            final Quat r2now = QR2.get();
+            final Quaterniond bodyNow = QD_D.get().set(r2now.getX(), r2now.getY(), r2now.getZ(), r2now.getW());
+
+            if (!params.hasForceLimit()) {
+                // Creative grip: drive the orientation directly towards the
+                // target — no inertia, no angle deltas (fast spins cannot
+                // alias at the 0/360 wrap, the old jerk-on-fast-rotation bug).
+                // The step is rate-limited: instant for small errors, and
+                // capped by edge speed for huge bodies — snapping a 100 m
+                // building across its full error in one tick would sweep its
+                // ends through the terrain. Applied once, on the axis carrying
+                // the fresh angular targets. Angular velocity is zeroed so no
+                // spin accumulates or survives the release.
+                if (axisOrdinal == 3 && scene != null) {
+                    double dx = desiredW.x, dy = desiredW.y, dz = desiredW.z, dw = desiredW.w;
+                    double dot = bodyNow.x * dx + bodyNow.y * dy + bodyNow.z * dz + bodyNow.w * dw;
+                    if (dot < 0.0) {
+                        dx = -dx;
+                        dy = -dy;
+                        dz = -dz;
+                        dw = -dw;
+                        dot = -dot;
+                    }
+                    final double angle = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, dot)));
+                    if (angle > 1.0e-9) {
+                        worldInertiaDiagonal(b2, bodyNow, angMass);
+                        final float[] iwSnap = WORLD_INERTIA.get();
+                        final float iwSnapMax = Math.max(iwSnap[0], Math.max(iwSnap[1], iwSnap[2]));
+                        final double radius = Math.sqrt(3.0 * Math.max(iwSnapMax, 1.0e-9f) / Math.max(angMass, 1.0e-9f));
+                        // Instant below the threshold; eased by edge speed above.
+                        final double alpha;
+                        if (radius <= SNAP_INSTANT_RADIUS) {
+                            alpha = 1.0;
+                        } else {
+                            final double maxStep = Math.min(SNAP_MAX_STEP, SNAP_TIP_SPEED * DT / Math.max(radius, 1.0e-6));
+                            alpha = Math.min(1.0, maxStep / angle);
+                        }
+                        final double qx = bodyNow.x + (dx - bodyNow.x) * alpha;
+                        final double qy = bodyNow.y + (dy - bodyNow.y) * alpha;
+                        final double qz = bodyNow.z + (dz - bodyNow.z) * alpha;
+                        final double qw = bodyNow.w + (dw - bodyNow.w) * alpha;
+                        final double inv = 1.0 / Math.sqrt(Math.max(1.0e-18, qx * qx + qy * qy + qz * qz + qw * qw));
+                        b2.getCenterOfMassPosition(C_COM.get());
+                        final RVec3 com = C_COM.get();
+                        scene.getBodyInterface().setPositionAndRotation(joltIdB,
+                                com.xx(), com.yy(), com.zz(),
+                                (float) (qx * inv), (float) (qy * inv), (float) (qz * inv), (float) (qw * inv),
+                                EActivation.Activate);
+                    }
+                    b2.setAngularVelocity(0.0f, 0.0f, 0.0f);
+                }
+                return;
+            }
+
+            // Inertia-scaled response: huge bodies turn slowly, small bodies
+            // briskly (Rapier-like). A single torque cap cannot do this — it
+            // starves the small while the huge plow through contacts — so the
+            // commanded speed itself scales with inertia, and the torque cap
+            // below stays generous.
+            worldInertiaDiagonal(b2, bodyNow, angMass);
+            final float[] iw = WORLD_INERTIA.get();
+            final float iwMax = Math.max(iw[0], Math.max(iw[1], iw[2]));
+            final double gainEff;
+            final double omegaCap;
+            if (params.hasForceLimit()) {
+                gainEff = gain;
+                omegaCap = MAX_ANGULAR_TOTAL_SPEED;
+            } else {
+                gainEff = Math.min(MAX_LINEAR_GAIN, Math.sqrt(params.stiffness() / Math.max(iwMax, 1.0e-9f)) + 1.0);
+                final double radius = Math.sqrt(3.0 * Math.max(iwMax, 1.0e-9f) / Math.max(angMass, 1.0e-9f));
+                omegaCap = Math.min(MAX_ANGULAR_TOTAL_SPEED,
+                        Math.min(gainEff * 2.0, TIP_SPEED_MAX / Math.max(radius, 1.0e-6)));
+            }
+
+            // QD_B (desiredCs) is dead past the desiredW computation above;
+            // QD_D (bodyNow) must survive for the torque arm and debug output.
+            final Quaterniond delta = QD_B.get();
+            Vector3d omegaW = scene == null ? null : scene.getCachedAngularOmega(joltIdB);
+            if (omegaW == null || axisOrdinal == 3) {
+                omegaW = VEC_OMEGA.get();
+                omegaW.set(0.0, 0.0, 0.0);
+                final Quaterniond prevDesired = scene == null ? null : scene.getAngularFollowPrev(joltIdB);
+                if (prevDesired != null) {
+                    prevDesired.conjugate(QD_E.get());
+                    desiredW.mul(QD_E.get(), delta);
+                    shortestArcInto(delta);
+                    final double ang = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, delta.w)));
+                    if (ang > 1.0e-5) {
+                        final double s = Math.sqrt(Math.max(0.0, 1.0 - delta.w * delta.w));
+                        final double inv = 1.0 / s;
+                        final double w = Math.min(ang / DT, MAX_ANGULAR_SPEED);
+                        omegaW.set(delta.x * inv * w, delta.y * inv * w, delta.z * inv * w);
+                    }
+                }
+
+                bodyNow.conjugate(QD_E.get());
+                desiredW.mul(QD_E.get(), delta);
+                shortestArcInto(delta);
+                final Quaterniond errW = delta;
+                final double errAngle = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, errW.w)));
+                if (errAngle > 1.0e-5) {
+                    final double s = Math.sqrt(Math.max(0.0, 1.0 - errW.w * errW.w));
+                    final double inv = 1.0 / s;
+                    final double w = Math.min(errAngle * gainEff, MAX_ANGULAR_SPEED);
+                    omegaW.x += errW.x * inv * w;
+                    omegaW.y += errW.y * inv * w;
+                    omegaW.z += errW.z * inv * w;
+                }
+
+                final double mag = Math.sqrt(omegaW.x * omegaW.x + omegaW.y * omegaW.y + omegaW.z * omegaW.z);
+                if (mag > omegaCap) {
+                    final double scale = omegaCap / mag;
+                    omegaW.x *= scale;
+                    omegaW.y *= scale;
+                    omegaW.z *= scale;
+                }
+                if (!isFinite(omegaW.x) || !isFinite(omegaW.y) || !isFinite(omegaW.z)) {
+                    omegaW.set(0.0, 0.0, 0.0);
+                }
+                if (scene != null) {
+                    scene.setAngularFollowPrev(joltIdB, desiredW);
+                    scene.setCachedAngularOmega(joltIdB, omegaW);
+                }
+            }
+
+            // tau_i = I_i * (omegaDesired - omega)_i / dt with the per-axis
+            // world-space inertia computed above. A mass scalar cannot turn
+            // huge bodies at all (I exceeds m by L^2/12 — hundreds of times
+            // for buildings), and a max-diagonal scalar would overshoot on
+            // the thin axes.
+            b2.getAngularVelocity(V_VEL.get());
+            final Vec3 omega = V_VEL.get();
+            double tx = iw[0] * (omegaW.x - omega.getX()) / DT;
+            double ty = iw[1] * (omegaW.y - omega.getY()) / DT;
+            double tz = iw[2] * (omegaW.z - omega.getZ()) / DT;
+            // Torque cap: generous for the creative grip (the commanded speed
+            // above already scales with inertia, so torques stay sane), legacy
+            // gentle cap for force-limited handles.
+            double torqueCap = iwMax * 60.0;
+            if (params.hasForceLimit()) {
+                torqueCap = angMass * 60.0;
+                if (params.maxForce() > 0.0) {
+                    torqueCap = Math.min(torqueCap, params.maxForce());
+                }
+            }
+            final double tLen = Math.sqrt(tx * tx + ty * ty + tz * tz);
+            if (tLen > torqueCap) {
+                final double scale = torqueCap / tLen;
+                tx *= scale;
+                ty *= scale;
+                tz *= scale;
+            }
+            if (isFinite(tx) && isFinite(ty) && isFinite(tz)) {
+                b2.addTorque((float) tx, (float) ty, (float) tz);
+            }
+            wx = tx;
+            wy = ty;
+            wz = tz;
+
+            if (JoltDebugLogging.HANDLE && axisOrdinal == 3) {
+                dev.ryanhcode.sable.Sable.LOGGER.info(
+                        "[SableJolt:handle] angServo: desiredW=({}, {}, {}, {}) bodyNow=({}, {}, {}, {}) tau=({}, {}, {}) gain={}",
+                        q1wJ.x, q1wJ.y, q1wJ.z, q1wJ.w, bodyNow.x, bodyNow.y, bodyNow.z, bodyNow.w,
+                        tx, ty, tz, gainEff);
+            }
+        }
+
+        scene.getBodyInterface().activateBody(joltIdA);
+        scene.getBodyInterface().activateBody(joltIdB);
+
+        if (JoltDebugLogging.STAFF) {
+            final RVec3 com2d = b2.getCenterOfMassPosition();
+            StaffDebug.motor((int) b2.getUserData(), com2d.xx(), com2d.yy(), com2d.zz(),
+                    new Vector3d(), axisOrdinal, params.target(),
+                    new Vector3d(),
+                    new Vector3d(wx, wy, wz),
+                    0.0, gain, effectiveMass(constraint),
+                    params.stiffness(), params.damping());
+        }
+    }
+
     private static Quaterniond shortestArc(final Quaterniond q) {
         final Quaterniond out = new Quaterniond(q);
         if (out.w < 0.0) {
@@ -212,6 +661,34 @@ public final class SixDofMotors {
         return out;
     }
 
+    /**
+     * In-place shortest-arc normalization. Same result as
+     * {@link #shortestArc(Quaterniond)} without the copy.
+     */
+    private static void shortestArcInto(final Quaterniond q) {
+        if (q.w < 0.0) {
+            q.x = -q.x;
+            q.y = -q.y;
+            q.z = -q.z;
+            q.w = -q.w;
+        }
+    }
+
+    /**
+     * Writes the joint-local frame rotation into scratch (or returns the
+     * shared identity when the frame is world-aligned). Replaces a per-call
+     * {@code Quat.sIdentity()}/{@code new Quat(...)}.
+     */
+    private static Quat scratchJointLocal(@Nullable final Quaterniond jointFrameQuatLocal) {
+        if (jointFrameQuatLocal == null) {
+            return IDENTITY_QUAT;
+        }
+        final Quat out = Q_JOINT.get();
+        out.set((float) jointFrameQuatLocal.x, (float) jointFrameQuatLocal.y,
+                (float) jointFrameQuatLocal.z, (float) jointFrameQuatLocal.w);
+        return out;
+    }
+
     private static Quat mulQuat(final Quat a, final Quat b) {
         final float ax = a.getX(), ay = a.getY(), az = a.getZ(), aw = a.getW();
         final float bx = b.getX(), by = b.getY(), bz = b.getZ(), bw = b.getW();
@@ -220,6 +697,23 @@ public final class SixDofMotors {
                 aw * by - ax * bz + ay * bw + az * bx,
                 aw * bz + ax * by - ay * bx + az * bw,
                 aw * bw - ax * bx - ay * by - az * bz);
+    }
+
+    /**
+     * Quaternion product written into {@code dest} (same flops as
+     * {@link #mulQuat}, no allocation). {@code dest} may not alias the inputs
+     * unless the inputs are fully read first — all reads below complete before
+     * any write.
+     */
+    private static Quat mulQuatInto(final Quat a, final Quat b, final Quat dest) {
+        final float ax = a.getX(), ay = a.getY(), az = a.getZ(), aw = a.getW();
+        final float bx = b.getX(), by = b.getY(), bz = b.getZ(), bw = b.getW();
+        dest.set(
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz);
+        return dest;
     }
 
     private static double targetOf(final MotorParams[] state, final int axis) {
@@ -245,30 +739,36 @@ public final class SixDofMotors {
      * frame rotation includes the constraint orientation, not just the body rotation).
      */
     private static Vector3d currentLinearPositionCs(final SixDofConstraint constraint, final com.github.stephengold.joltjni.SixDofConstraintSettings settings,
-                                                    @Nullable final Quaterniond jointFrameQuatLocal) {
+                                                     @Nullable final Quaterniond jointFrameQuatLocal, final Vector3d dest) {
         try {
             final Body b1 = constraint.getBody1();
             final Body b2 = constraint.getBody2();
 
-            final RVec3 com1 = b1.getCenterOfMassPosition();
-            final RVec3 com2 = b2.getCenterOfMassPosition();
-            final Quat r1 = b1.getRotation();
-            final Quat r2 = b2.getRotation();
+            b1.getCenterOfMassPosition(C_COM.get());
+            b2.getCenterOfMassPosition(C_COM2.get());
+            b1.getRotation(QR1.get());
+            b2.getRotation(QR2.get());
+            final RVec3 com1 = C_COM.get();
+            final RVec3 com2 = C_COM2.get();
+            final Quat r1 = QR1.get();
+            final Quat r2 = QR2.get();
 
             final var p1 = settings.getPosition1();
             final var p2 = settings.getPosition2();
 
-            final Vec3 a1 = rotate(new Vec3((float) p1.xx(), (float) p1.yy(), (float) p1.zz()), r1);
-            final Vec3 a2 = rotate(new Vec3((float) p2.xx(), (float) p2.yy(), (float) p2.zz()), r2);
+            final Vec3 a1 = V_ROT.get();
+            rotateInto((float) p1.xx(), (float) p1.yy(), (float) p1.zz(), r1, a1);
+            final double a1x = a1.getX(), a1y = a1.getY(), a1z = a1.getZ();
+            rotateInto((float) p2.xx(), (float) p2.yy(), (float) p2.zz(), r2, a1);
 
             // world-space delta between anchors
-            final double dx = (com2.xx() + a2.getX()) - (com1.xx() + a1.getX());
-            final double dy = (com2.yy() + a2.getY()) - (com1.yy() + a1.getY());
-            final double dz = (com2.zz() + a2.getZ()) - (com1.zz() + a1.getZ());
+            final double dx = (com2.xx() + a1.getX()) - (com1.xx() + a1x);
+            final double dy = (com2.yy() + a1.getY()) - (com1.yy() + a1y);
+            final double dz = (com2.zz() + a1.getZ()) - (com1.zz() + a1z);
 
             // into the joint frame: world delta rotated by the inverse of
             // (body1 rotation * joint frame local rotation)
-            final Quat inv;
+            final Quat inv = Q_INV.get();
             if (jointFrameQuatLocal != null) {
                 final float qx = r1.getX(), qy = r1.getY(), qz = r1.getZ(), qw = r1.getW();
                 final float jx = (float) jointFrameQuatLocal.x, jy = (float) jointFrameQuatLocal.y;
@@ -278,15 +778,15 @@ public final class SixDofMotors {
                 final float cy = qw * jy - qx * jz + qy * jw + qz * jx;
                 final float cz = qw * jz + qx * jy - qy * jx + qz * jw;
                 final float cw = qw * jw - qx * jx - qy * jy - qz * jz;
-                inv = new Quat(-cx, -cy, -cz, cw);
+                inv.set(-cx, -cy, -cz, cw);
             } else {
-                inv = r1.conjugated();
+                inv.set(-r1.getX(), -r1.getY(), -r1.getZ(), r1.getW());
             }
 
-            final Vec3 local = rotate(new Vec3((float) dx, (float) dy, (float) dz), inv);
-            return new Vector3d(local.getX(), local.getY(), local.getZ());
+            rotateInto((float) dx, (float) dy, (float) dz, inv, a1);
+            return dest.set(a1.getX(), a1.getY(), a1.getZ());
         } catch (final Throwable t) {
-            return new Vector3d();
+            return dest.set(0.0, 0.0, 0.0);
         }
     }
 
@@ -303,18 +803,87 @@ public final class SixDofMotors {
     }
 
     /**
+     * Quaternion rotation written into {@code dest} (same flops as
+     * {@link #rotate}, no allocation). Alias-safe: all inputs are read into
+     * locals before any write.
+     */
+    private static void rotateInto(final float vx, final float vy, final float vz,
+                                   final Quat q, final Vec3 dest) {
+        final float qx = q.getX(), qy = q.getY(), qz = q.getZ(), qw = q.getW();
+        final float tx = 2.0f * (qy * vz - qz * vy);
+        final float ty = 2.0f * (qz * vx - qx * vz);
+        final float tz = 2.0f * (qx * vy - qy * vx);
+        dest.set(
+                vx + qw * tx + (qy * tz - qz * ty),
+                vy + qw * ty + (qz * tx - qx * tz),
+                vz + qw * tz + (qx * ty - qy * tx));
+    }
+
+    private static final ThreadLocal<Vec3> INV_DIAG = ThreadLocal.withInitial(Vec3::new);
+    private static final ThreadLocal<float[]> WORLD_INERTIA = ThreadLocal.withInitial(() -> new float[3]);
+
+    /**
+     * Writes the world-space inertia diagonal of a body into the per-thread
+     * scratch buffer. Falls back to the scalar mass when the motion properties
+     * are unavailable (a locked axis reports zero inverse inertia and keeps
+     * the mass fallback — it cannot be driven anyway).
+     */
+    private static void worldInertiaDiagonal(final Body body, final Quaterniond rot, final float mass) {
+        float ilx = mass, ily = mass, ilz = mass;
+        try {
+            final var motion = body.getMotionProperties();
+            if (motion != null) {
+                final Vec3 inv = INV_DIAG.get();
+                motion.getInverseInertiaDiagonal(inv);
+                if (inv.getX() > 1.0e-12f) {
+                    ilx = 1.0f / inv.getX();
+                }
+                if (inv.getY() > 1.0e-12f) {
+                    ily = 1.0f / inv.getY();
+                }
+                if (inv.getZ() > 1.0e-12f) {
+                    ilz = 1.0f / inv.getZ();
+                }
+            }
+        } catch (final Throwable ignored) {
+            // fall back to mass
+        }
+        // Diagonal of R * diag(il) * R^T from the quaternion.
+        final double x = rot.x, y = rot.y, z = rot.z, w = rot.w;
+        final double r00 = 1.0 - 2.0 * (y * y + z * z);
+        final double r01 = 2.0 * (x * y - z * w);
+        final double r02 = 2.0 * (x * z + y * w);
+        final double r10 = 2.0 * (x * y + z * w);
+        final double r11 = 1.0 - 2.0 * (x * x + z * z);
+        final double r12 = 2.0 * (y * z - x * w);
+        final double r20 = 2.0 * (x * z - y * w);
+        final double r21 = 2.0 * (y * z + x * w);
+        final double r22 = 1.0 - 2.0 * (x * x + y * y);
+        final float[] out = WORLD_INERTIA.get();
+        out[0] = (float) (r00 * r00 * ilx + r01 * r01 * ily + r02 * r02 * ilz);
+        out[1] = (float) (r10 * r10 * ilx + r11 * r11 * ily + r12 * r12 * ilz);
+        out[2] = (float) (r20 * r20 * ilx + r21 * r21 * ily + r22 * r22 * ilz);
+    }
+
+    /**
      * The reduced mass of the two constraint bodies (static bodies count as infinite mass).
      */
     private static float effectiveMass(final SixDofConstraint constraint) {
         float invMass = 0.0f;
         try {
             final var b1 = constraint.getBody1();
-            if (b1.isDynamic() && b1.getMotionProperties() != null) {
-                invMass += b1.getMotionProperties().getInverseMass();
+            if (b1.isDynamic()) {
+                final var mp1 = b1.getMotionProperties();
+                if (mp1 != null) {
+                    invMass += mp1.getInverseMass();
+                }
             }
             final var b2 = constraint.getBody2();
-            if (b2.isDynamic() && b2.getMotionProperties() != null) {
-                invMass += b2.getMotionProperties().getInverseMass();
+            if (b2.isDynamic()) {
+                final var mp2 = b2.getMotionProperties();
+                if (mp2 != null) {
+                    invMass += mp2.getInverseMass();
+                }
             }
         } catch (final Throwable ignored) {
             return 1.0f;

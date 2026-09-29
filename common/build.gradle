@@ -1,5 +1,29 @@
+plugins {
+    id 'me.champeau.jmh' version '0.7.3'
+}
+
 architectury {
     common rootProject.enabled_platforms.split(',')
+}
+
+jmh {
+    jmhVersion = '1.37'
+    // Headless run: gradle :common:jmh
+    // Narrow it down: gradle :common:jmh -PjmhIncludes='.*Step.*'
+    // Alloc rates:    gradle :common:jmh -PjmhProfilers='gc'
+    jvmArgs = ['-Xmx2g']
+    if (project.hasProperty('jmhIncludes')) {
+        includes = [(String) project.property('jmhIncludes')]
+    }
+    if (project.hasProperty('jmhProfilers')) {
+        profilers = ((String) project.property('jmhProfilers')).split(',').toList()
+    }
+}
+
+// The shadowed benchmark jar bundles the whole runtime (both Minecraft jars),
+// which exceeds the 64k zip entry limit.
+tasks.named('jmhJar') {
+    zip64 = true
 }
 
 dependencies {
@@ -14,4 +38,32 @@ dependencies {
     modCompileOnly files(rootProject.file("libs/dev.ryanhcode.sable.sable-sable_rapier-1.21.1-2.0.5.jar"))
     modCompileOnly files(rootProject.file("libs/sable-fabric-1.21.1-2.0.5.jar"))
     modCompileOnly files(rootProject.file("libs/sable-companion-fabric-1.21.1-1.6.0.jar"))
+
+    // Headless JMH runtime: these are compileOnly/modCompileOnly in main but
+    // the benchmarks execute real physics (natives + registries) outside the game.
+    jmhImplementation "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version"
+    jmhRuntimeOnly "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version:ReleaseDp"
+    jmhImplementation files(rootProject.file("libs/dev.ryanhcode.sable.sable-sable_rapier-1.21.1-2.0.5.jar"))
+    jmhImplementation files(rootProject.file("libs/sable-fabric-1.21.1-2.0.5.jar"))
+    jmhImplementation files(rootProject.file("libs/sable-companion-fabric-1.21.1-1.6.0.jar"))
+
+    // The local sable jars above are compiled against intermediary Minecraft
+    // names, so the headless JMH runtime needs the intermediary merged jar too
+    // (normally a hidden loom internal). Resolved lazily from the Gradle user
+    // home, so it works on any machine with a populated loom cache. Override
+    // with -PjmhIntermediaryJar=<path> when several cached layers exist.
+    jmhRuntimeOnly files({
+        def override = findProperty('jmhIntermediaryJar')
+        if (override != null) {
+            return files(override)
+        }
+        def cands = fileTree(
+            dir: new File(gradle.gradleUserHomeDir, 'caches/fabric-loom/minecraftMaven/net/minecraft/minecraft-merged-intermediary'),
+            include: "**/minecraft-merged-intermediary-${rootProject.minecraft_version}-*.jar"
+        ).files.findAll { it.isFile() && it.name.endsWith('.jar') }.sort { it.absolutePath }
+        if (cands.isEmpty()) {
+            throw new GradleException('JMH needs the loom intermediary Minecraft jar: run a normal build first to populate the loom cache')
+        }
+        return cands.take(1)
+    })
 }
