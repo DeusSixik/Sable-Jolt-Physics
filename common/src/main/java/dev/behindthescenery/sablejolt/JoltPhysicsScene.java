@@ -672,9 +672,57 @@ public final class JoltPhysicsScene {
                 mount.mountId = -1;
             }
         }
+        // Native constraints and rope attachments hold raw references to their
+        // bodies: destroying a body with live attachments leaves dangling
+        // native references behind, and the next system.update() dies with an
+        // access violation inside joltjni.dll. Detach everything first (Sable
+        // re-creates the attachments it still needs, e.g. on the remove and
+        // re-add recovery path).
+        this.detachBodyAttachments(sb.joltId);
         this.bi.removeBody(sb.joltId);
         this.bi.destroyBody(sb.joltId);
         this.bodyIdsVersion++;
+    }
+
+    /**
+     * Removes every joint and rope attachment mounted on the given body, and
+     * drops its servo caches. Called before the native body is destroyed so no
+     * native object keeps referencing the freed body.
+     */
+    private void detachBodyAttachments(final int joltId) {
+        if (!this.joints.isEmpty()) {
+            // Collect first: removeJoint mutates the map under iteration.
+            LongArrayList deadJoints = null;
+            for (final var entry : this.joints.long2ObjectEntrySet()) {
+                final JointRecord rec = entry.getValue();
+                if (rec.joltIdA != joltId && rec.joltIdB != joltId) {
+                    continue;
+                }
+                if (deadJoints == null) {
+                    deadJoints = new LongArrayList();
+                }
+                deadJoints.add(entry.getLongKey());
+            }
+            if (deadJoints != null) {
+                for (int i = 0; i < deadJoints.size(); i++) {
+                    this.removeJoint(deadJoints.getLong(i));
+                }
+            }
+        }
+        if (!this.ropes.isEmpty()) {
+            for (final RopeStrand strand : this.ropes.values()) {
+                if (strand.start != null && strand.start.mountJoltId == joltId) {
+                    this.removeConstraint(strand.start.constraint);
+                    strand.start = null;
+                }
+                if (strand.end != null && strand.end.mountJoltId == joltId) {
+                    this.removeConstraint(strand.end.constraint);
+                    strand.end = null;
+                }
+            }
+        }
+        this.angularFollowPrev.remove(joltId);
+        this.angularCachedOmega.remove(joltId);
     }
 
     public void createSubLevel(final int id, final Vector3dc pos, final Quaterniondc rot) {
@@ -2231,19 +2279,50 @@ public final class JoltPhysicsScene {
                 continue;
             }
             final int idx = sb.snapIndex;
-            sb.snapX = this.snapshotPos.get(idx * 3);
-            sb.snapY = this.snapshotPos.get(idx * 3 + 1);
-            sb.snapZ = this.snapshotPos.get(idx * 3 + 2);
-            sb.snapComX = this.snapshotCom.get(idx * 3);
-            sb.snapComY = this.snapshotCom.get(idx * 3 + 1);
-            sb.snapComZ = this.snapshotCom.get(idx * 3 + 2);
-            sb.snapQx = this.snapshotRot.get(idx * 4);
-            sb.snapQy = this.snapshotRot.get(idx * 4 + 1);
-            sb.snapQz = this.snapshotRot.get(idx * 4 + 2);
-            sb.snapQw = this.snapshotRot.get(idx * 4 + 3);
+            final double px = this.snapshotPos.get(idx * 3);
+            final double py = this.snapshotPos.get(idx * 3 + 1);
+            final double pz = this.snapshotPos.get(idx * 3 + 2);
+            final double cx = this.snapshotCom.get(idx * 3);
+            final double cy = this.snapshotCom.get(idx * 3 + 1);
+            final double cz = this.snapshotCom.get(idx * 3 + 2);
+            final float qx = this.snapshotRot.get(idx * 4);
+            final float qy = this.snapshotRot.get(idx * 4 + 1);
+            final float qz = this.snapshotRot.get(idx * 4 + 2);
+            final float qw = this.snapshotRot.get(idx * 4 + 3);
             float vx = this.snapshotLin.get(idx * 3);
             float vy = this.snapshotLin.get(idx * 3 + 1);
             float vz = this.snapshotLin.get(idx * 3 + 2);
+            final float ax = this.snapshotAng.get(idx * 3);
+            final float ay = this.snapshotAng.get(idx * 3 + 1);
+            final float az = this.snapshotAng.get(idx * 3 + 2);
+            // Poison watchdog: non-finite state (NaN/Inf position, rotation or
+            // velocity) makes the NEXT native update read garbage and die with
+            // EXCEPTION_ACCESS_VIOLATION inside joltjni.dll. Quarantine the body
+            // instead: restore the last finite snapshot, zero the velocities
+            // and put it to sleep so the solver never sees the poison. The
+            // cached fields keep serving the last good values downstream.
+            if (!(Double.isFinite(px) && Double.isFinite(py) && Double.isFinite(pz)
+                    && Double.isFinite(cx) && Double.isFinite(cy) && Double.isFinite(cz)
+                    && Float.isFinite(qx) && Float.isFinite(qy) && Float.isFinite(qz) && Float.isFinite(qw)
+                    && Float.isFinite(vx) && Float.isFinite(vy) && Float.isFinite(vz)
+                    && Float.isFinite(ax) && Float.isFinite(ay) && Float.isFinite(az))) {
+                this.quarantinePoisonedBody(sb);
+                if (sb.children.size() >= HEAVY_BODY_CHILDREN) {
+                    heavyBody = true;
+                }
+                sb.snapGen = gen;
+                continue;
+            }
+            sb.snapX = px;
+            sb.snapY = py;
+            sb.snapZ = pz;
+            sb.snapComX = cx;
+            sb.snapComY = cy;
+            sb.snapComZ = cz;
+            sb.snapQx = qx;
+            sb.snapQy = qy;
+            sb.snapQz = qz;
+            sb.snapQw = qw;
             // Tunneling guard for huge bodies (no CCD): cap speed below one
             // block per tick. Inlined here — velocities are already in hand —
             // instead of a separate post pass over all bodies.
@@ -2261,12 +2340,36 @@ public final class JoltPhysicsScene {
             sb.snapVx = vx;
             sb.snapVy = vy;
             sb.snapVz = vz;
-            sb.snapAx = this.snapshotAng.get(idx * 3);
-            sb.snapAy = this.snapshotAng.get(idx * 3 + 1);
-            sb.snapAz = this.snapshotAng.get(idx * 3 + 2);
+            sb.snapAx = ax;
+            sb.snapAy = ay;
+            sb.snapAz = az;
             sb.snapGen = gen;
         }
         this.snapshotHeavyBody = heavyBody;
+    }
+
+    private long lastPoisonLogNanos;
+
+    /**
+     * Quarantines a body whose native state read back non-finite: restores the
+     * last finite snapshot pose, zeroes velocities and deactivates it so the
+     * next {@code system.update} never ingests the poison. Rate-limited logging.
+     */
+    private void quarantinePoisonedBody(final SableBody sb) {
+        final long now = System.nanoTime();
+        if (now - this.lastPoisonLogNanos > 1_000_000_000L) {
+            this.lastPoisonLogNanos = now;
+            Sable.LOGGER.error("[SableJolt] body {} (jolt {}) read back non-finite state; quarantined at last good pose",
+                    sb.runtimeId, sb.joltId);
+        }
+        try {
+            this.bi.setPositionAndRotation(sb.joltId, sb.snapX, sb.snapY, sb.snapZ,
+                    sb.snapQx, sb.snapQy, sb.snapQz, sb.snapQw, EActivation.DontActivate);
+            this.bi.setLinearAndAngularVelocity(sb.joltId, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            this.bi.deactivateBody(sb.joltId);
+        } catch (final Throwable ignored) {
+            // best effort: the body is already unusable
+        }
     }
 
     private void ensureSnapshotBuffers(final int n) {
