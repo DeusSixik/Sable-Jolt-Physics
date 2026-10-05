@@ -8,3 +8,4 @@
 /common/build
 /sable-rapier-module
 /common/.gradle
+*.log

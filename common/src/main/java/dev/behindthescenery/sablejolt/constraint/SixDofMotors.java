@@ -415,7 +415,10 @@ public final class SixDofMotors {
             }
             if (isFinite(fx) && isFinite(fy) && isFinite(fz)) {
                 if (params.hasForceLimit()) {
-                    b2.addForce((float) fx, (float) fy, (float) fz, axW, ayW, azW);
+                    // NOTE: the anchor keeps its historical float rounding
+                    // (the old code passed it through `new RVec3(float,float,float)`);
+                    // full double precision here would shift torque arms.
+                    b2.addForce((float) fx, (float) fy, (float) fz, (float) axW, (float) ayW, (float) azW);
                 } else {
                     b2.addForce((float) fx, (float) fy, (float) fz, com2.xx(), com2.yy(), com2.zz());
                 }
