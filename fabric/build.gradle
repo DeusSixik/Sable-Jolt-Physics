@@ -36,6 +36,10 @@ dependencies {
     shadowBundle "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version"
     shadowBundle "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version:ReleaseDp"
     shadowBundle "com.github.stephengold:jolt-jni-Linux64:$rootProject.jolt_version:ReleaseDp"
+    // ARM servers and macOS (singleplayer); other platforms fall back to Rapier.
+    shadowBundle "com.github.stephengold:jolt-jni-Linux_ARM64:$rootProject.jolt_version:ReleaseDp"
+    shadowBundle "com.github.stephengold:jolt-jni-MacOSX64:$rootProject.jolt_version:ReleaseDp"
+    shadowBundle "com.github.stephengold:jolt-jni-MacOSX_ARM64:$rootProject.jolt_version:ReleaseDp"
 
     runtimeOnly "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version"
     runtimeOnly "com.github.stephengold:jolt-jni-Windows64:$rootProject.jolt_version:ReleaseDp"

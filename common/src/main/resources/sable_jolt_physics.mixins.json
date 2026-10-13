@@ -1,5 +1,5 @@
 {
-  "required": true,
+  "required": false,
   "package": "dev.behindthescenery.sableJoltPhysics.mixin",
   "compatibilityLevel": "JAVA_21",
   "minVersion": "0.8",
@@ -9,6 +9,6 @@
     "RapierPhysicsPipelineProviderMixin"
   ],
   "injectors": {
-    "defaultRequire": 1
+    "defaultRequire": 0
   }
 }

@@ -1,8 +1,7 @@
 package dev.behindthescenery.sablejolt.collider;
 
-import com.github.stephengold.joltjni.BoxShape;
-import com.github.stephengold.joltjni.Vec3;
 import com.github.stephengold.joltjni.readonly.ConstShape;
+import dev.behindthescenery.sablejolt.JoltPhysicsScene;
 import dev.ryanhcode.sable.api.physics.callback.BlockSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.collider.VoxelColliderData;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
@@ -14,6 +13,7 @@ import org.joml.Vector3dc;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
  * The physics data of a single block state, kept entirely on the Java side.
@@ -46,8 +46,10 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
 
     /**
      * Lazily built shared shapes, one per box index, reused by every body.
+     * Elements are published with volatile semantics: section rebuilds read
+     * them from worker threads without taking the lock.
      */
-    private volatile ConstShape[] shapes;
+    private volatile AtomicReferenceArray<ConstShape> shapes;
 
     JoltVoxelColliderData(final double frictionMultiplier, final double volume, final double restitution,
                           final boolean isFluid, @Nullable final BlockSubLevelCollisionCallback contactEvents,
@@ -85,33 +87,44 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
      * Returns (building if necessary) the shared box shape for the given box index.
      */
     public ConstShape shape(final int boxIndex) {
-        ConstShape[] arr = this.shapes;
-        if (arr == null || arr.length <= boxIndex || arr[boxIndex] == null) {
-            synchronized (this) {
-                arr = this.shapes;
-                if (arr == null) {
-                    arr = new ConstShape[Math.max(this.boxes.size(), 1)];
-                    this.shapes = arr;
-                }
-                if (boxIndex < arr.length && arr[boxIndex] == null) {
-                    final VoxelBox b = this.boxes.get(boxIndex);
-                    final float hx = Math.max((b.maxX - b.minX) * 0.5f, 0.0001f);
-                    final float hy = Math.max((b.maxY - b.minY) * 0.5f, 0.0001f);
-                    final float hz = Math.max((b.maxZ - b.minZ) * 0.5f, 0.0001f);
-                    arr[boxIndex] = new BoxShape(hx, hy, hz, 0.025f);
-                }
+        final AtomicReferenceArray<ConstShape> current = this.shapes;
+        if (current != null && boxIndex < current.length()) {
+            final ConstShape shape = current.get(boxIndex);
+            if (shape != null) {
+                return shape;
             }
         }
-        return arr[boxIndex];
+        synchronized (this) {
+            AtomicReferenceArray<ConstShape> arr = this.shapes;
+            if (arr == null || arr.length() <= boxIndex) {
+                // Boxes can be added after the first lookup (lazy box build).
+                final AtomicReferenceArray<ConstShape> grown =
+                        new AtomicReferenceArray<>(Math.max(Math.max(this.boxes.size(), boxIndex + 1), 1));
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        grown.set(i, arr.get(i));
+                    }
+                }
+                arr = grown;
+                this.shapes = arr;
+            }
+            ConstShape shape = arr.get(boxIndex);
+            if (shape == null) {
+                final VoxelBox b = this.boxes.get(boxIndex);
+                final float hx = (b.maxX - b.minX) * 0.5f;
+                final float hy = (b.maxY - b.minY) * 0.5f;
+                final float hz = (b.maxZ - b.minZ) * 0.5f;
+                shape = JoltPhysicsScene.newBoxShape(hx, hy, hz, 0.025f);
+                arr.set(boxIndex, shape);
+            }
+            return shape;
+        }
     }
 
     @Override
     public void addBox(final Vector3dc min, final Vector3dc max) {
-        this.boxes.add(new VoxelBox(
-                (float) min.x(), (float) min.y(), (float) min.z(),
-                (float) max.x(), (float) max.y(), (float) max.z()
-        ));
-        this.shapes = null;
+        this.addBox((float) min.x(), (float) min.y(), (float) min.z(),
+                (float) max.x(), (float) max.y(), (float) max.z());
     }
 
     public void addBox(final double minX, final double minY, final double minZ,
@@ -119,15 +132,20 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
         this.addBox((float) minX, (float) minY, (float) minZ, (float) maxX, (float) maxY, (float) maxZ);
     }
 
-    public void addBox(final float minX, final float minY, final float minZ,
-                       final float maxX, final float maxY, final float maxZ) {
+    public synchronized void addBox(final float minX, final float minY, final float minZ,
+                                    final float maxX, final float maxY, final float maxZ) {
+        // Degenerate boxes (zero extent on an axis) carry no collision.
+        if (!(maxX > minX && maxY > minY && maxZ > minZ)) {
+            return;
+        }
         this.boxes.add(new VoxelBox(
                 minX, minY, minZ, maxX, maxY, maxZ
         ));
+        this.shapes = null;
     }
 
     @Override
-    public void clearBoxes() {
+    public synchronized void clearBoxes() {
         this.boxes.clear();
         this.shapes = null;
     }
@@ -215,7 +233,7 @@ public final class JoltVoxelColliderData implements VoxelColliderData {
         }
 
         public final boolean fullCube() {
-            return minX == 0 && minY == 0 && minZ == 0 && maxX == 0 && maxY == 1 && maxZ == 1;
+            return minX == 0 && minY == 0 && minZ == 0 && maxX == 1 && maxY == 1 && maxZ == 1;
         }
     }
 }

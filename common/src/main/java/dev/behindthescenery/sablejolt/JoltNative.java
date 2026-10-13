@@ -3,9 +3,6 @@ package dev.behindthescenery.sablejolt;
 import com.github.stephengold.joltjni.Jolt;
 import com.github.stephengold.joltjni.JoltPhysicsObject;
 import dev.ryanhcode.sable.Sable;
-import net.minecraft.CrashReport;
-import net.minecraft.CrashReportCategory;
-import net.minecraft.ReportedException;
 import net.minecraft.Util;
 import net.minecraft.Util.OS;
 import org.jetbrains.annotations.ApiStatus;
@@ -24,6 +21,10 @@ import java.util.Locale;
  * Native binaries are expected on the classpath in the standard jolt-jni layout:
  * {@code <os>/<arch>/com/github/stephengold/<libname>}, as packaged by the
  * classified {@code jolt-jni-<Platform>} artifacts.
+ * <p>
+ * Loading never crashes the game: when the natives are missing for the current
+ * platform or fail to link, {@link #tryInitialize()} reports false and the
+ * pipeline provider falls back to Sable's Rapier backend.
  */
 @ApiStatus.Internal
 public final class JoltNative {
@@ -31,12 +32,18 @@ public final class JoltNative {
     private static final Path NATIVE_DIR = resolveNativeDir();
 
     private static boolean initialized = false;
+    private static boolean failed = false;
 
     private JoltNative() {
     }
 
     private static Path resolveNativeDir() {
-        final Path gameDir = dev.ryanhcode.sable.platform.SableLoaderPlatform.INSTANCE.getGameDirectory();
+        Path gameDir = null;
+        try {
+            gameDir = dev.ryanhcode.sable.platform.SableLoaderPlatform.INSTANCE.getGameDirectory();
+        } catch (final Throwable ignored) {
+            // fall back to the user home
+        }
         if (gameDir != null) {
             return gameDir.resolve(".sable").resolve("jolt-natives").normalize();
         }
@@ -44,8 +51,8 @@ public final class JoltNative {
     }
 
     private static String getResourcePath() {
-        final String arch = System.getProperty("os.arch").contains("arm") || System.getProperty("os.arch").startsWith("aarch64")
-                ? "aarch64" : "x86-64";
+        final String osArch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        final String arch = osArch.contains("arm") || osArch.startsWith("aarch64") ? "aarch64" : "x86-64";
 
         final OS os = Util.getPlatform();
         final String prefix;
@@ -64,11 +71,15 @@ public final class JoltNative {
     }
 
     /**
-     * Ensures the native library is loaded and the engine is bootstrapped.
+     * Loads the natives once. Returns false (after logging the reason once)
+     * when Jolt cannot run on this platform; never throws.
      */
-    public static synchronized void ensureInitialized() {
+    public static synchronized boolean tryInitialize() {
         if (initialized) {
-            return;
+            return true;
+        }
+        if (failed) {
+            return false;
         }
 
         try {
@@ -78,7 +89,7 @@ public final class JoltNative {
             final byte[] bytes;
             try (final InputStream is = JoltNative.class.getResourceAsStream("/" + resourcePath)) {
                 if (is == null) {
-                    throw new FileNotFoundException(resourcePath + " (is the classified jolt-jni natives artifact on the classpath?)");
+                    throw new FileNotFoundException(resourcePath + " (no Jolt natives are bundled for this platform)");
                 }
                 bytes = is.readAllBytes();
             }
@@ -110,12 +121,21 @@ public final class JoltNative {
             initialized = true;
             Sable.LOGGER.info("Jolt Physics initialized ({}, {})", Jolt.versionString(), Jolt.buildType());
         } catch (final Throwable t) {
-            Sable.LOGGER.error("Sable Jolt failed to load the Jolt natives. Please report with system details and logs to {}", Sable.ISSUE_TRACKER_URL, t);
-            final CrashReport crashReport = CrashReport.forThrowable(t, "Sable linking with Jolt natives");
-            final CrashReportCategory category = crashReport.addCategory("Natives");
-            category.setDetail("Resource", getResourcePath());
-            category.setDetail("Native Directory", NATIVE_DIR.toAbsolutePath().toString());
-            throw new ReportedException(crashReport);
+            failed = true;
+            Sable.LOGGER.error("[SableJolt] Jolt Physics is unavailable on this system ({} {}, native dir {}); "
+                            + "Sable will use its built-in Rapier physics instead. Sub-levels are not affected.",
+                    System.getProperty("os.name"), System.getProperty("os.arch"),
+                    NATIVE_DIR.toAbsolutePath(), t);
+        }
+        return initialized;
+    }
+
+    /**
+     * Ensures the native library is loaded; throws when Jolt is unavailable.
+     */
+    public static void ensureInitialized() {
+        if (!tryInitialize()) {
+            throw new IllegalStateException("Jolt Physics natives are not available on this system");
         }
     }
 
