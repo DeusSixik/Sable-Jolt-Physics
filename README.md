@@ -16,16 +16,18 @@
   </a>
 </p>
 
-<!--
+
 <p align="center">
+    <!--
   <a href="https://modrinth.com/mod/sable-jolt-physics">
     <img src="https://img.shields.io/modrinth/dt/sable-jolt-physics?logo=modrinth&label=&suffix=%20&style=flat&color=242629&labelColor=5CA424&logoColor=1C1C1C" alt="Modrinth">
   </a>
+    -->
   <a href="https://www.curseforge.com/minecraft/mc-mods/sable-jolt-physics">
     <img src="https://img.shields.io/curseforge/dt/<YOUR_PROJECT_ID>?logo=curseforge&label=&suffix=%20&style=flat&color=242629&labelColor=F16436&logoColor=1C1C1C" alt="CurseForge">
   </a>
 </p>
--->
+
 
 ---
 
