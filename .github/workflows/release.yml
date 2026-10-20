@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths: [gradle.properties]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect mod_version change
+        id: version
+        shell: bash
+        run: |
+          get_version() { grep -E '^mod_version=' | head -n1 | cut -d= -f2- | tr -d '\r[:space:]'; }
+
+          NEW=$(get_version < gradle.properties)
+          if [ -z "$NEW" ]; then
+            echo "mod_version not found in gradle.properties" >&2
+            exit 1
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          OLD=""
+          if [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            OLD=$(git show "$BEFORE:gradle.properties" 2>/dev/null | get_version || true)
+          fi
+
+          echo "old=$OLD new=$NEW"
+
+          RELEASE=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$OLD" != "$NEW" ]; then
+            RELEASE=true
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$NEW" >/dev/null 2>&1; then
+            echo "Tag v$NEW already exists, skipping"
+            RELEASE=false
+          fi
+
+          PRE=false
+          if [[ "$NEW" =~ (alpha|beta|rc|snapshot|pre) ]]; then PRE=true; fi
+
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
+        if: steps.version.outputs.release == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        if: steps.version.outputs.release == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        if: steps.version.outputs.release == 'true'
+        run: ./gradlew build --no-daemon
+
+      - name: Collect artifacts
+        if: steps.version.outputs.release == 'true'
+        shell: bash
+        run: |
+          mkdir -p release-files
+          for p in fabric neoforge; do
+            for f in "$p"/build/libs/*.jar; do
+              case "$f" in
+                *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-all.jar) continue ;;
+              esac
+              cp "$f" release-files/
+            done
+          done
+          ls -l release-files
+
+      - name: Create tag and GitHub release
+        if: steps.version.outputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ github.event.repository.name }} ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          files: release-files/*.jar
+          fail_on_unmatched_files: true
