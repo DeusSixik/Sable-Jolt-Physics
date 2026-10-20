@@ -61,7 +61,7 @@ jobs:
 
       - name: Set up JDK 21
         if: steps.version.outputs.release == 'true'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
@@ -72,7 +72,9 @@ jobs:
 
       - name: Build
         if: steps.version.outputs.release == 'true'
-        run: ./gradlew build --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
 
       - name: Collect artifacts
         if: steps.version.outputs.release == 'true'
