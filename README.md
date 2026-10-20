@@ -66,7 +66,7 @@ Tick time was measured with `/tick query`. Values are min-max.
 ## Known limitations
 
 > [!WARNING]
-> The project is in Alpha; stable operation is not guaranteed.
+> The project is in Alpha stable operation is not guaranteed.
 > Please report any issues in [Issues](https://github.com/DeusSixik/Sable-Jolt-Physics/issues).
 
 > [!CAUTION]
