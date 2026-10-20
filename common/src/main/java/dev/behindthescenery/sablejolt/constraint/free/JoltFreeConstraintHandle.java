@@ -53,7 +53,7 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
     public static JoltFreeConstraintHandle create(final JoltPhysicsScene scene, @Nullable final PhysicsPipelineBody bodyA, @Nullable final PhysicsPipelineBody bodyB, final FreeConstraintConfiguration config, final boolean renderFrameServo) {
         final JoltPhysicsScene.SableBody sbA = bodyA == null ? null : scene.body(bodyA.getRuntimeId());
         final JoltPhysicsScene.SableBody sbB = bodyB == null ? null : scene.body(bodyB.getRuntimeId());
-        if (sbA == null && sbB == null) {
+        if ((sbA == null && sbB == null) || !scene.canConstrain(bodyA, sbA) || !scene.canConstrain(bodyB, sbB)) {
             return new JoltFreeConstraintHandle(scene, -1);
         }
 

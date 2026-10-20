@@ -5,7 +5,6 @@ import com.github.stephengold.joltjni.HingeConstraintSettings;
 import com.github.stephengold.joltjni.MotorSettings;
 import com.github.stephengold.joltjni.SpringSettings;
 import com.github.stephengold.joltjni.Vec3;
-import com.github.stephengold.joltjni.RVec3;
 import com.github.stephengold.joltjni.enumerate.EMotorState;
 import com.github.stephengold.joltjni.enumerate.ESpringMode;
 import dev.behindthescenery.sablejolt.JoltPhysicsScene;
@@ -22,19 +21,12 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
     public static JoltRotaryConstraintHandle create(final JoltPhysicsScene scene, @Nullable final PhysicsPipelineBody bodyA, @Nullable final PhysicsPipelineBody bodyB, final RotaryConstraintConfiguration config) {
         final JoltPhysicsScene.SableBody sbA = bodyA == null ? null : scene.body(bodyA.getRuntimeId());
         final JoltPhysicsScene.SableBody sbB = bodyB == null ? null : scene.body(bodyB.getRuntimeId());
-        if (sbA == null && sbB == null) {
+        if ((sbA == null && sbB == null) || !scene.canConstrain(bodyA, sbA) || !scene.canConstrain(bodyB, sbB)) {
             return new JoltRotaryConstraintHandle(scene, -1);
         }
 
         final int joltA = sbA != null ? sbA.joltId : scene.groundBodyId();
         final int joltB = sbB != null ? sbB.joltId : scene.groundBodyId();
-
-        final double comAx = sbA != null ? sbA.centerOfMass.x : 0.0;
-        final double comAy = sbA != null ? sbA.centerOfMass.y : 0.0;
-        final double comAz = sbA != null ? sbA.centerOfMass.z : 0.0;
-        final double comBx = sbB != null ? sbB.centerOfMass.x : 0.0;
-        final double comBy = sbB != null ? sbB.centerOfMass.y : 0.0;
-        final double comBz = sbB != null ? sbB.centerOfMass.z : 0.0;
 
         final HingeConstraintSettings settings = new HingeConstraintSettings();
         settings.setSpace(com.github.stephengold.joltjni.enumerate.EConstraintSpace.LocalToBodyCom);
@@ -62,8 +54,7 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
         record.fixedContacts = false;
         final long id = scene.registerJoint(record);
 
-        final JoltRotaryConstraintHandle handle = new JoltRotaryConstraintHandle(scene, id);
-        return handle;
+        return new JoltRotaryConstraintHandle(scene, id);
     }
 
     private JoltRotaryConstraintHandle(final JoltPhysicsScene scene, final long handle) {
@@ -79,7 +70,7 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
     }
 
     private static Vec3 perpendicular(final Vec3 axis) {
-        final float ax = Math.abs(axis.getX()), ay = Math.abs(axis.getY()), az = Math.abs(axis.getZ());
+        final float ax = Math.abs(axis.getX());
         final Vec3 other = ax < 0.9f ? new Vec3(1.0f, 0.0f, 0.0f) : new Vec3(0.0f, 0.0f, 1.0f);
         final float x = axis.getY() * other.getZ() - axis.getZ() * other.getY();
         final float y = axis.getZ() * other.getX() - axis.getX() * other.getZ();
@@ -94,15 +85,40 @@ public class JoltRotaryConstraintHandle extends JoltConstraintHandle implements 
         if (record == null || !(record.constraint instanceof final HingeConstraint hinge)) {
             return;
         }
-        hinge.setMotorState(EMotorState.Position);
+        if (!Double.isFinite(target) || !Double.isFinite(stiffness) || !Double.isFinite(damping)) {
+            return;
+        }
         final MotorSettings motor = hinge.getMotorSettings();
         final SpringSettings spring = motor.getSpringSettings();
-        spring.setMode(ESpringMode.StiffnessAndDamping);
-        spring.setStiffness((float) stiffness);
-        spring.setDamping((float) damping);
-        if (hasForceLimit) {
-            motor.setTorqueLimit((float) maxForce);
+        if (this.scene.isRapierCompatible()) {
+            // Rapier's position motor is acceleration based: stiffness (1/s^2) and
+            // damping (1/s) are scaled by the joint's effective inertia, so the
+            // response is the same for light and heavy parts. Jolt expresses that
+            // as a spring frequency and damping ratio.
+            if (stiffness > 1.0e-9) {
+                final double omega = Math.sqrt(stiffness);
+                spring.setMode(ESpringMode.FrequencyAndDamping);
+                spring.setFrequency((float) (omega / (2.0 * Math.PI)));
+                spring.setDamping((float) (Math.max(0.0, damping) / (2.0 * omega)));
+                hinge.setMotorState(EMotorState.Position);
+                hinge.setTargetAngle((float) target);
+            } else if (damping > 0.0) {
+                // Pure damper: brake the relative rotation.
+                hinge.setMotorState(EMotorState.Velocity);
+                hinge.setTargetAngularVelocity(0.0f);
+            } else {
+                hinge.setMotorState(EMotorState.Off);
+            }
+        } else {
+            hinge.setMotorState(EMotorState.Position);
+            spring.setMode(ESpringMode.StiffnessAndDamping);
+            spring.setStiffness((float) stiffness);
+            spring.setDamping((float) damping);
+            hinge.setTargetAngle((float) target);
         }
-        hinge.setTargetAngle((float) target);
+        // Like Rapier, motor updates do not wake the bodies.
+        if (hasForceLimit && Double.isFinite(maxForce)) {
+            motor.setTorqueLimit((float) Math.abs(maxForce));
+        }
     }
 }

@@ -22,7 +22,8 @@ public record JoltRopeHandle(JoltPhysicsScene scene, long handle) implements Rop
             coordinates[i * 3 + 2] = point.z;
         }
 
-        final long handle = scene.createRope(pointRadius, points.get(0).distance(points.get(1)), coordinates, points.size());
+        final double firstLength = points.size() >= 2 ? points.get(0).distance(points.get(1)) : 1.0;
+        final long handle = scene.createRope(pointRadius, firstLength, coordinates, points.size());
         return new JoltRopeHandle(scene, handle);
     }
 
@@ -32,8 +33,9 @@ public record JoltRopeHandle(JoltPhysicsScene scene, long handle) implements Rop
     @Override
     public void readPose(final List<Vector3d> dest) {
         final double[] coordinates = this.scene.queryRope(this.handle);
-        for (int i = 0; i < coordinates.length; i += 3) {
-            dest.get(i / 3).set(coordinates[i], coordinates[i + 1], coordinates[i + 2]);
+        final int count = Math.min(coordinates.length / 3, dest.size());
+        for (int i = 0; i < count; i++) {
+            dest.get(i).set(coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
         }
     }
 
