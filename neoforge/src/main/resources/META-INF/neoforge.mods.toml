@@ -11,7 +11,7 @@ authors = ""
 description = '''
 
 '''
-#logoFile = ""
+logoFile = "assets/sable_jolt_physics/icon.png"
 
 [[dependencies.sable_jolt_physics]]
 modId = "neoforge"

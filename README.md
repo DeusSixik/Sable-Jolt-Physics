@@ -10,6 +10,12 @@
   <a href="https://github.com/dimforge/rapier">Rapier</a>.
 </p>
 
+<p align="center">
+  <a href="https://jitpack.io/#DeusSixik/Sable-Jolt-Physics">
+    <img src="https://jitpack.io/v/DeusSixik/Sable-Jolt-Physics.svg" alt="JitPack">
+  </a>
+</p>
+
 <!--
 <p align="center">
   <a href="https://modrinth.com/mod/sable-jolt-physics">
@@ -65,6 +71,22 @@ Tick time was measured with `/tick query`. Values are min-max.
 
 > [!CAUTION]
 > Sable's behavior with Jolt may differ from its behavior with Rapier.
+
+## Using as a dependency (JitPack)
+
+```gradle
+repositories {
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    // <tag> is a release tag such as v1.2.0-alpha
+    modCompileOnly 'com.github.DeusSixik.Sable-Jolt-Physics:common:<tag>'
+    // or a platform artifact:
+    // modImplementation 'com.github.DeusSixik.Sable-Jolt-Physics:fabric:<tag>'
+    // modImplementation 'com.github.DeusSixik.Sable-Jolt-Physics:neoforge:<tag>'
+}
+```
 
 ## Acknowledgements
 

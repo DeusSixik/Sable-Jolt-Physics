@@ -4,6 +4,7 @@
   "version": "${version}",
   "name": "Sable-Jolt-Physics",
   "description": "",
+  "icon": "assets/sable_jolt_physics/icon.png",
   "authors": [
     ""
   ],
